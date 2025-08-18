@@ -67,6 +67,7 @@ class PolicyGradient(BaseAlgo):
             self._seed,
             self._cfgs,
         )
+        # Semantic adapter swap (inactive by default) - algorithms can override _env after calling super().
         assert (self._cfgs.algo_cfgs.steps_per_epoch) % (
             distributed.world_size() * self._cfgs.train_cfgs.vector_env_nums
         ) == 0, 'The number of steps per epoch is not divisible by the number of environments.'
@@ -403,6 +404,38 @@ class PolicyGradient(BaseAlgo):
                 'Train/KL': final_kl,
             },
         )
+        # Semantic risk head update hook (only if semantic manager attached by subclass/override)
+        if hasattr(self, '_semantic_manager') and hasattr(self._cfgs, 'semantic_cfgs') and getattr(self, '_semantic_manager') is not None:  # type: ignore[attr-defined]
+            sem_cfg = self._cfgs.semantic_cfgs  # type: ignore[attr-defined]
+            if getattr(sem_cfg, 'risk_enable', False):
+                if not hasattr(self, '_risk_head'):
+                    from omnisafe.common.semantics.risk_head import SemanticRiskHead
+                    example_emb = self._semantic_manager.get_recent_risk_batch()  # type: ignore[attr-defined]
+                    in_dim = example_emb.shape[1] if example_emb is not None else 512
+                    self._risk_head = SemanticRiskHead(in_dim).to(self._device)
+                    self._risk_opt = torch.optim.Adam(self._risk_head.parameters(), lr=1e-3)
+                batch_embs = self._semantic_manager.get_recent_risk_batch()  # type: ignore[attr-defined]
+                if batch_embs is not None and batch_embs.shape[0] > 8:
+                    embs = batch_embs.to(self._device)
+                    costs = torch.tensor(list(self._semantic_manager.costs), dtype=torch.float32, device=self._device)  # type: ignore[attr-defined]
+                    L = min(len(costs), embs.shape[0])
+                    embs = embs[-L:]
+                    costs = costs[-L:]
+                    horizon = getattr(sem_cfg, 'risk_horizon', 64)
+                    gamma = getattr(sem_cfg, 'discount', 0.99)
+                    with torch.no_grad():
+                        targets = []
+                        for i in range(L):
+                            rng = costs[i:i+horizon]
+                            disc = torch.tensor([gamma ** k for k in range(len(rng))], device=costs.device)
+                            targets.append((rng * disc).sum())
+                        targets = torch.stack(targets)
+                    preds = self._risk_head(embs)
+                    loss = torch.nn.functional.smooth_l1_loss(preds, targets)
+                    self._risk_opt.zero_grad()
+                    loss.backward()
+                    self._risk_opt.step()
+                    self._logger.store({'Risk/Loss': loss.item(), 'Risk/PredMean': preds.mean().item()})
 
     def _update_reward_critic(self, obs: torch.Tensor, target_value_r: torch.Tensor) -> None:
         r"""Update value network under a double for loop.

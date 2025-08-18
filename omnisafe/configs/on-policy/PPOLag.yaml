@@ -130,6 +130,25 @@ defaults:
     lambda_optimizer: "Adam"
   # environment specific configurations
   env_cfgs: {}
+  # semantic (optional) configurations
+  semantic_cfgs:
+    enable: False
+    capture_interval: 4
+    frame_size: 224
+    model_name: "openai/clip-vit-base-patch16"
+    shaping_enable: False
+    risk_enable: False
+    modulation_enable: False
+    beta_start: 0.05
+    beta_end_step_fraction: 0.4
+    risk_horizon: 64
+    discount: 0.99
+    alpha_modulation: 2.0
+    threshold_percentile: 60
+    slope: 5.0
+    window_size: 2048
+    safe_prompts: ["clear path to goal", "centered trajectory", "ample clearance"]
+    unsafe_prompts: ["imminent collision", "tight near-obstacle turn", "risky close pass"]
 
 ShadowHandCatchOver2UnderarmSafeFinger:
   # training configurations
