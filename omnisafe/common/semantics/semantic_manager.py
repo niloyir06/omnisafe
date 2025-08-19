@@ -29,11 +29,13 @@ class SemanticConfig:
     model_device: str = "cuda:0"
     # host_device: where centroids, returned embeddings, and subsequent computations live (usually 'cpu')
     host_device: str = "cpu"
-    beta_start: float = 0.05
-    beta_end_step_fraction: float = 0.4
+    beta_start: float = 0.15
+    beta_end_step_fraction: float = 0.7  # (NOTE: consider reverting to 0.4 if this was unintentional)
     shaping_enable: bool = False
     risk_enable: bool = False
     modulation_enable: bool = False
+    # Risk head learning rate (instead of hard-coded value)
+    risk_lr: float = 1e-3
     risk_horizon: int = 64
     discount: float = 0.99
     alpha_modulation: float = 2.0
@@ -41,11 +43,21 @@ class SemanticConfig:
     slope: float = 5.0
     window_size: int = 2048
     norm_window: int = 1000
+    # Margin normalization control & scaling (diagnostics)
+    margin_norm_enable: bool = True
+    margin_scale: float = 1.0  # multiply raw margin before normalization/clipping
+    # Potential-based shaping toggle: if True uses beta*(gamma*phi_next - phi_prev) with phi = normed margin
+    potential_enable: bool = False
+    # Environment-specific base descriptive prompts (red car, green goal, purple obstacles, blue cubes)
     safe_prompts: List[str] = field(default_factory=lambda: [
-        "clear path to goal", "centered trajectory", "ample clearance"
+        "red car moving toward green goal",
+        "clear path ahead to green goal",
+        "red car aligned safely avoiding obstacles",
     ])
     unsafe_prompts: List[str] = field(default_factory=lambda: [
-        "imminent collision", "tight near-obstacle turn", "risky close pass"
+        "red car near purple obstacle collision",
+        "red car pushing into blue cube hazard",
+        "blocked path crowded with purple obstacles",
     ])
     # Spatial batching options
     batch_across_envs: bool = True  # attempt to embed all env frames together
@@ -85,6 +97,16 @@ class SemanticManager:
         self.costs = deque(maxlen=self.cfg.window_size)
         self._margins = deque(maxlen=self.cfg.norm_window)
         self._load_clip_and_prompts()
+        # Debug / telemetry fields
+        self._last_margin_raw = 0.0
+        self._last_margin_norm = 0.0
+        self._last_beta = 0.0
+        self._total_margins = 0
+        self._clipped_margins = 0
+        self._capture_count = 0  # number of embedding capture events (single or batched)
+        self._last_capture_step = -1  # for effective interval telemetry
+        # Potential shaping state
+        self._prev_phi = None
 
     def _load_clip_and_prompts(self) -> None:
         if not self.cfg.enable:
@@ -137,6 +159,8 @@ class SemanticManager:
             return None
         start = time.time()
         try:
+            self._capture_count += 1
+            self._last_capture_step = self.global_step
             with torch.no_grad():
                 batch = self.clip_proc(images=frame, return_tensors="pt")
                 batch = {k: v.to(self.model_device) for k, v in batch.items()}
@@ -160,6 +184,8 @@ class SemanticManager:
             return [None for _ in frames]
         # Clamp batch size
         frames = list(frames)[: self.cfg.batch_max]
+        self._capture_count += 1
+        self._last_capture_step = self.global_step
 
         def _embed(list_frames: List):  # recursive helper
             start = time.time()
@@ -201,15 +227,59 @@ class SemanticManager:
             safe_sim = torch.matmul(embedding, self.safe_centroid[0])
             unsafe_sim = torch.matmul(embedding, self.unsafe_centroid[0])
             margin = (safe_sim - unsafe_sim).item()
-        self._margins.append(margin)
+        margin *= self.cfg.margin_scale
         norm_margin = margin
-        if len(self._margins) > 30:
-            m = sum(self._margins) / len(self._margins)
-            var = sum((x - m) ** 2 for x in self._margins) / len(self._margins)
-            std = (var ** 0.5) or 1.0
-            norm_margin = (margin - m) / std
+        if self.cfg.margin_norm_enable:
+            self._margins.append(margin)
+            if len(self._margins) > 30:
+                m = sum(self._margins) / len(self._margins)
+                var = sum((x - m) ** 2 for x in self._margins) / len(self._margins)
+                std = (var ** 0.5) or 1.0
+                norm_margin = (margin - m) / std
         beta = self._beta_schedule()
-        return beta * max(min(norm_margin, 2.0), -2.0)
+        clipped_norm = max(min(norm_margin, 2.0), -2.0)
+        phi = norm_margin  # un-clipped potential
+        if self.cfg.potential_enable:
+            if self._prev_phi is None:
+                shaping = 0.0
+            else:
+                shaping = beta * (self.cfg.discount * phi - self._prev_phi)
+            self._prev_phi = phi
+        else:
+            shaping = beta * clipped_norm
+        # Telemetry updates
+        self._last_margin_raw = margin
+        self._last_margin_norm = norm_margin
+        self._last_beta = beta
+        self._total_margins += 1
+        if clipped_norm != norm_margin:
+            self._clipped_margins += 1
+        return shaping
+
+    # --- Telemetry accessors (lightweight) ---
+    def debug_metrics(self) -> dict[str, float]:
+        """Return latest semantic telemetry metrics.
+
+        Consumers (adapter) can log these without recomputation.
+        """
+        clamp_frac = (
+            float(self._clipped_margins) / float(self._total_margins)
+            if self._total_margins > 0
+            else 0.0
+        )
+        effective_interval = (
+            float(self.global_step - self._last_capture_step)
+            if self._last_capture_step >= 0
+            else 0.0
+        )
+        return {
+            'Semantics/RawMargin': self._last_margin_raw,
+            'Semantics/NormMargin': self._last_margin_norm,
+            'Semantics/Beta': self._last_beta,
+            'Semantics/ClampFrac': clamp_frac,
+            'Semantics/CaptureCount': float(self._capture_count),
+            'Semantics/CaptureIntervalEffective': effective_interval,
+        }
 
     def _beta_schedule(self) -> float:
         steps_end = int(self.total_steps * self.cfg.beta_end_step_fraction)

@@ -44,22 +44,36 @@ $$
 $$
 Standard value losses (reward and cost critics) and entropy regularization are added as in PPO.
 
-#### 4.0.3 Semantic Reward Shaping
+#### 4.0.3 Semantic Reward Shaping (Additive vs Potential-Based)
 Let a frozen vision-language encoder map an observation (frame) $x_t$ to an embedding $e_t \in \mathbb{R}^d$. Safe and unsafe prompt sets $\mathcal{P}_{safe}, \mathcal{P}_{unsafe}$ are encoded; their (optionally normalized) centroids are $\mu_{safe}, \mu_{unsafe}$. Define the semantic margin
 $$
 m_t = \cos(e_t, \mu_{safe}) - \cos(e_t, \mu_{unsafe}).
 $$
-Maintain running mean/variance $\mu_m, \sigma_m^2$ to obtain a normalized margin $\tilde m_t = (m_t - \mu_m)/(\sigma_m + \varepsilon)$. Apply clipping $\bar m_t = \operatorname{clip}(\tilde m_t, -M, M)$.
+Maintain running mean/variance $\mu_m, \sigma_m^2$ to obtain a normalized margin $\tilde m_t = (m_t - \mu_m)/(\sigma_m + \varepsilon)$. Apply global scaling (config `margin_scale`) then optional clipping $\bar m_t = \operatorname{clip}(\tilde m_t, -M, M)$ when normalization enabled; if normalization disabled we operate directly on the (scaled) raw margin before clipping.
 
-Annealed shaping coefficient (cosine schedule up to an $\alpha$-fraction of training steps $T_{anneal}=\alpha T$):
+Cosine annealed shaping coefficient (up to an $\alpha$ fraction of total steps $T_{anneal}=\alpha T$):
 $$
 \beta_t = \beta_0 \cdot \tfrac{1}{2} \Big(1 + \cos\big(\pi \cdot \min(1, t / T_{anneal})\big) \Big).
 $$
-Shaped reward:
+
+We implement two shaping modes:
+
+1. Additive (legacy / default when `potential_enable=False`):
 $$
 r'_t = r_t + \beta_t \bar m_t.
 $$
-Because $\beta_t \to 0$ as $t \to T_{anneal}$, asymptotic optimality under the original MDP is preserved (potential-based shaping like guarantees are approximated via annealing to null influence).
+2. Potential-based (when `potential_enable=True`): define a potential function $\phi(s_t)=\bar m_t$ (post normalization & scaling) captured only on semantic capture steps. Using $\gamma$ (reward discount), shaping term per transition:
+$$
+F_t = \beta_t (\gamma \phi(s_{t+1}) - \phi(s_t)).
+$$
+Reward becomes $r'_t = r_t + F_t$. This preserves optimal policies exactly if $\beta_t$ stabilizes (or decays to 0) because potential differences telescope in episodic returns; here $\beta_t$ also anneals, further ensuring neutrality. We cache previous $\phi(s_t)$ to compute $F_t$ lazily; when a capture is skipped we reuse the last potential (yielding zero shaping increment), maintaining schedule continuity.
+
+Practical notes:
+* Potential mode avoids long-horizon bias inherent in persistent additive bonuses when $\beta_t$ is non-zero for extended windows.
+* Additive mode can accelerate very early learning when semantic signal is sparse; potential mode is preferred for unbiased comparisons once benefit is established.
+* Both modes share the same annealing schedule, normalization toggles (`margin_norm_enable`), scaling (`margin_scale`), and capture cadence.
+
+Diagnostic Metrics (see §4.0.7): `Semantics/ShapingRewardRatio` and `Semantics/ShapingStd` quantify relative shaping influence and dispersion to validate neutrality assumptions.
 
 #### 4.0.4 Auxiliary Risk Prediction
 Define truncated discounted cost target (sliding horizon):
@@ -85,6 +99,14 @@ Future work: adjust effective learning rate of $\lambda$ update: $ \lambda \left
 
 #### 4.0.6 Convergence Considerations
 Because shaping vanishes ($\beta_t \to 0$) and auxiliary loss does not alter the final reward signal, fixed points coincide with those of PPO-Lagrange (assuming perfect critics). Auxiliary risk training influences representation quality and early policy gradients but not terminal optimality.
+
+#### 4.0.7 New Telemetry for Shaping Influence
+To ensure semantic guidance remains a gentle curriculum rather than a persistent bias, we log:
+
+* ShapingRewardRatio: $\displaystyle \frac{\mathbb{E}[\text{shaping}]}{\mathbb{E}[r]}$ where denominator uses the raw environment reward (pre-shaping). Target band (empirical heuristic) is roughly 5–15% in the earliest 10–20% of training, decaying toward 0 with $\beta_t$.
+* ShapingStd: Standard deviation of per-env shaping values within a capture batch (or 0 in scalar path). High dispersion with small mean may indicate prompt polarity inconsistencies; persistent low std with near-zero ratio can indicate insufficient semantic separability or over-aggressive normalization.
+
+These metrics support: (a) early detection of over-shaping (ratio spikes), (b) validation that potential-based shaping collapses ratio faster than additive, (c) prompt engineering decisions (std vs mean trade-offs).
 
 ### 4.1 SemanticManager
 Responsibilities:
@@ -322,8 +344,12 @@ Risk Head Training Loop:
 | `Semantics/EmbedSuccessRate` | Ratio | Counters | successes / attempts over window |
 | `Semantics/Debug/EmbedAttempts` | Counter | Adapter | Total attempted embedding calls |
 | `Semantics/Debug/EmbedSuccess` | Counter | Adapter | Successful embedding extractions |
-| `Semantics/Debug/ClipReady` | Binary | Manager flag | 1 if model loaded and centroids computed |
-| `Semantics/Debug/ClipStatus` | Categorical string | Manager | Encodes dtype success or error class |
+| `Semantics/RawMargin` | Scalar | SemanticManager | Last raw cosine margin (post scale) |
+| `Semantics/NormMargin` | Scalar | SemanticManager | Z-normalized margin (if enabled) |
+| `Semantics/Beta` | Scalar | Schedule | Current shaping coefficient |
+| `Semantics/ClampFrac` | Ratio | SemanticManager | Fraction of margins historically clipped |
+| `Semantics/CaptureCount` | Counter | SemanticManager | Number of capture events |
+| `Semantics/CaptureIntervalEffective` | Scalar | SemanticManager | Steps since last capture |
 | `Risk/Loss` | Scalar | Risk head train loop | Smooth L1 loss |
 | `Risk/PredMean` | Scalar | Risk head output | Mean predicted discounted cost |
 | `Risk/TargetMean` | Scalar | Computed targets | Mean target truncated discounted cost |
@@ -574,6 +600,9 @@ python examples/train_policy.py --algo PPOLagSem --env-id SafetyCarGoal1-v0 --se
 | v1.2 | Deep dive + change log | Formal math, dtype matrix, performance notes |
 | v1.3 | 2025-08-18 | Runtime behavior clarifications, batching design, config troubleshooting, roadmap re-prioritized |
 | v1.4 | 2025-08-19 | Executive technical summary, parity pseudocode, clarified risk head training phase |
+| v1.5 | 2025-08-19 | Spatial batching (per-env embeddings & shaping), batch OOM backoff, capture count telemetry |
+| v1.6 | 2025-08-19 | Telemetry expansion (RawMargin/NormMargin/Beta/ClampFrac/CaptureIntervalEffective), config additions (risk_lr, margin_norm_enable, margin_scale), removal of obsolete ClipReady/ClipStatus, CSV semantic analysis script |
+| v1.7 | 2025-08-19 | Potential-based shaping implementation (`potential_enable`), shaping influence metrics (ShapingRewardRatio, ShapingStd), documentation of additive vs potential formulation, neutrality rationale |
 
 ---
 ## 25. Executive Technical Summary (Consolidated)
@@ -677,6 +706,71 @@ backprop(loss)
 
 ### 25.16 Parity Guarantee Statement
 Formally: With `semantic_cfgs.enable=False`, code executes identical operations (order, tensors, gradients) as baseline PPO-Lagrange except for negligible conditional checks (branch predicate false). No additional modules, parameters, or memory allocations are instantiated.  Verified via: identical logged keys set, absence of semantic directories, and matching cumulative reward curves within stochastic variance.
+
+---
+
+## 28. v1.6 Addendum: Telemetry & Configuration Consolidation
+
+### 28.1 Overview
+This addendum documents the consolidation steps taken after spatial batching: richer semantic diagnostics, pruning of obsolete status logs, and introduction of scaling & normalization toggles to better understand—and control—the influence of semantic shaping on learning dynamics. It also records the analytic tooling added to interpret logged CSV metrics.
+
+### 28.2 New / Revised Telemetry (Supersedes Older Glossaries)
+| Key | Purpose | Design Philosophy | Value Provided |
+|-----|---------|------------------|----------------|
+| `Semantics/RawMargin` | Unnormalized (scaled) safe–unsafe cosine gap | Expose raw signal before statistical transforms | Diagnose prompt separability & need for scaling |
+| `Semantics/NormMargin` | Z-score of margin (rolling window) | Stabilize schedule across prompt sets; reversible via toggle | Comparable shaping scale across experiments |
+| `Semantics/Beta` | Instant shaping coefficient (cosine decay) | Make curriculum explicit & auditable | Correlate learning acceleration with schedule phase |
+| `Semantics/ClampFrac` | Cumulative fraction of clipped normalized margins | Detect over-aggressive clipping bounds | Decide whether to widen clamp or adjust scaling |
+| `Semantics/CaptureCount` | Total embedding capture events | Coverage accounting (esp. with batching) | Normalizes downstream ratios (e.g., success rate) |
+| `Semantics/CaptureIntervalEffective` | Steps since last capture | Reveal skipped / delayed captures (e.g., exceptions) | Ensures schedule consistency & identifies dead zones |
+
+Removed (noise reduction): `Semantics/Debug/ClipReady`, `Semantics/Debug/ClipStatus` — once CLIP load stabilized and status strings ceased to vary meaningfully across runs they were pruned to reclaim log bandwidth and focus attention on actionable metrics.
+
+### 28.3 Config Additions & Rationale
+| Config Field | Default | Rationale | Failure Mode Mitigated | Value |
+|--------------|---------|----------|------------------------|-------|
+| `risk_lr` | 1e-3 | Decouple auxiliary head optimization speed from hard-coded constant | Over/under-fitting of risk predictor when changing horizon/discount | Tunable convergence of risk head without code edits |
+| `margin_norm_enable` | True | Allow ablation of normalization; inspect raw scale | Over-normalization masking prompt improvements | Clear attribution: is normalization helping? |
+| `margin_scale` | 1.0 | Controlled amplification of raw margin when separation weak | Very low signal-to-noise shaping < reward noise | Rapid what-if scaling without prompt churn |
+
+### 28.4 Design Philosophy Recap
+1. **Early Bias, Long-term Neutrality**: Shaping coefficient anneals to zero so asymptotic optimal policy set is preserved (semi-potential approach). Telemetry (`Beta`, `ClampFrac`) confirms actual decay shape & clipping health.
+2. **Observability First**: Introduce diagnostics (margins, clamp fraction, capture interval) before advanced control (e.g., modulation) to avoid blind tuning.
+3. **Separation of Concerns**: `SemanticManager` owns semantic state (prompts, embeddings, schedule); adapters stay thin; PPO core unmodified—facilitating safe iterative augmentation.
+4. **Fail-Soft Architecture**: On any embedding failure path we emit zeros while still advancing `global_step` ensuring schedule continuity and preventing skewed normalization windows.
+5. **Incremental Instrumentation Removal**: Once readiness signals ceased to provide new information they were removed to reduce log entropy—favoring high information density metrics.
+
+### 28.5 Value of Each Key Addition (Narrative)
+- **RawMargin / NormMargin**: Unlock root-cause analysis (`low raw margin variance` vs `normalization suppressing extremes`). Previously only aggregate shaping magnitude hid whether issue was schedule or semantic separability.
+- **Beta**: Makes curriculum debuggable; without logging, any plateau could be misattributed to algorithm instability instead of near-zero shaping weight.
+- **ClampFrac**: Guards against silent saturation; high clamp rate indicates either prompts too extreme or scaling too high—actionable levers.
+- **CaptureIntervalEffective**: Detects latent performance regressions (e.g., occasional render failures) that would otherwise silently reduce semantic coverage.
+- **margin_scale & norm toggle**: Provide orthogonal levers (scale amplitude vs normalize distribution) enabling controlled studies without editing code.
+- **risk_lr**: Unlocks independent tuning; risk head and policy may demand different effective learning rates depending on horizon.
+
+### 28.6 CSV Analysis Script (`examples/semantic_analysis.py`)
+Added a reusable analysis utility that:
+- Locates latest `progress.csv` per run label.
+- Produces smoothed return & cost curves, cost-return frontier scatter.
+- Plots Beta schedule, RawMargin trajectories, ClampFrac trend, shaping magnitude.
+- Computes summary statistics (final/avg return & cost, shaping ratio, margin stats, margin→future-return correlations) and emits `summary.json`.
+Purpose: Provide fast iteration loop for semantic feature justification (quantify benefit or diagnose neutrality before deeper engineering effort).
+
+### 28.7 Alignment with Thesis Theme
+The instrumentation & config refinements shift the project from *“we added a VLM-derived scalar”* to *“we systematically evaluate when and why foundational multimodal features produce safe RL benefits”*. Every new metric reduces epistemic uncertainty about whether underperformance arises from signal scarcity, mis-scaling, curriculum timing, or fundamental semantic irrelevance—central to credible claims about leveraging foundational models for safety.
+
+### 28.8 Next High-Impact Steps (Post v1.6)
+1. Wire `risk_lr` into optimizer creation (currently hard-coded usage pending) + log actual lr.
+2. Introduce potential-based shaping variant (beta * (γ φ(s') - φ(s))) to remove residual bias while preserving early guidance—compare cost & return neutrality.
+3. Spatial batching statistical validation: log per-env shaping std and mean to confirm variance reduction claim vs pre-batching scalar broadcast.
+4. Margin→cost predictive power: log rolling Pearson corr(margin_t, future_cost_{t:t+H}) to decide if further prompt engineering warranted.
+5. Automated prompt set evaluation harness (select highest AUC separating high vs low cost frames).
+
+### 28.9 Risk of Over-Instrumentation & Mitigation
+Risk: Excess metrics increase cognitive load. Mitigation: Grouped semantic metrics share prefix; obsolete readiness metrics culled; future additions must demonstrate unique decision leverage (documented in value table on introduction).
+
+### 28.10 Version Integrity
+This addendum supersedes earlier sections describing single-frame broadcast behavior as the “current” implementation; refer to v1.5/v1.6 for spatial batching truth. Legacy description retained historically but not authoritative for present code path.
 
 ---
 

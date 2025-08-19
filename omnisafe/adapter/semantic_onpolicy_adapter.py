@@ -33,18 +33,7 @@ class SemanticOnPolicyAdapter(OnPolicyAdapter):  # pragma: no cover minimal logi
         # Seed success rate metric to avoid NaN before any attempts
         if self._semantic_manager.cfg.enable:
             logger.store({'Semantics/EmbedSuccessRate': 0.0})
-            # Log clip readiness (0/1) once at start so metric never NaNs
-            clip_ready = int(getattr(self._semantic_manager, '_clip_ready', False))
-            logger.store({'Semantics/Debug/ClipReady': clip_ready})
-            # Log status string (dtype or error) for visibility
-            status = getattr(self._semantic_manager, '_clip_status', 'unknown')
-            code = 1 if status.startswith('ok') else (-1 if status.startswith('load_error') else 0)
-            logger.store({'Semantics/Debug/ClipStatus': float(code)})
-            # Store status as text if logger supports text logging (fall back to print via logger.log)
-            try:
-                logger.log(f"CLIP Status: {status}")
-            except Exception:  # noqa: BLE001
-                pass
+            # (ClipReady/ClipStatus removed from telemetry)
         batch_mode = self._semantic_manager.cfg.batch_across_envs and getattr(self._env, 'num_envs', 1) > 1
         for step in track(
             range(steps_per_epoch),
@@ -83,14 +72,28 @@ class SemanticOnPolicyAdapter(OnPolicyAdapter):  # pragma: no cover minimal logi
                         self._embed_success += success_ct
                         shaping_tensor = torch.as_tensor(shapings, device=reward.device, dtype=reward.dtype)
                         reward = reward + shaping_tensor
-                        # logging (aggregate shaping mean)
-                        logger.store({'Semantics/Shaping': shaping_tensor.mean()})
+                        # logging (aggregate shaping mean, ratio, std)
+                        mean_shaping = shaping_tensor.mean()
+                        logger.store({'Semantics/Shaping': mean_shaping})
+                        try:
+                            raw_reward_mean = reward.mean() - mean_shaping  # remove shaping to approximate base
+                            if abs(raw_reward_mean) > 1e-6:
+                                ratio = (mean_shaping / raw_reward_mean).clamp(-10, 10)
+                                logger.store({'Semantics/ShapingRewardRatio': ratio})
+                        except Exception:
+                            pass
+                        try:
+                            logger.store({'Semantics/ShapingStd': shaping_tensor.std(unbiased=False)})
+                        except Exception:
+                            logger.store({'Semantics/ShapingStd': torch.as_tensor(0.0)})
                         latency = self._semantic_manager.last_embed_latency_ms if success_ct > 0 else 0.0
                         logger.store({'Semantics/EmbedLatencyMs': latency})
                         logger.store({
                             'Semantics/Debug/EmbedAttempts': float(self._embed_attempts),
                             'Semantics/Debug/EmbedSuccess': float(self._embed_success),
                         })
+                        # Telemetry diagnostics (last embedding processed)
+                        logger.store(self._semantic_manager.debug_metrics())
                         # record risk data (use per-env mean cost element-wise) cost is vector length num_envs
                         mean_costs = cost.detach().cpu().tolist()
                         self._semantic_manager.record_multi_step(embeddings, mean_costs)
@@ -112,10 +115,20 @@ class SemanticOnPolicyAdapter(OnPolicyAdapter):  # pragma: no cover minimal logi
                             'Semantics/Debug/EmbedAttempts': float(self._embed_attempts),
                             'Semantics/Debug/EmbedSuccess': float(self._embed_success),
                         })
+                        if embedding is not None:
+                            logger.store(self._semantic_manager.debug_metrics())
                     except Exception:  # noqa: BLE001
                         pass
                     if shaping != 0.0:
                         reward = reward + shaping
+                        # ratio & std (scalar path: std=0)
+                        try:
+                            base = reward - shaping
+                            if abs(base.item()) > 1e-6:
+                                logger.store({'Semantics/ShapingRewardRatio': torch.as_tensor(shaping / base.item()).clamp(-10, 10)})
+                        except Exception:
+                            pass
+                        logger.store({'Semantics/ShapingStd': torch.as_tensor(0.0)})
                     self._semantic_manager.record_step(embedding, float(cost.mean().item()))
                     latency = self._semantic_manager.last_embed_latency_ms if embedding is not None else 0.0
                     logger.store({'Semantics/EmbedLatencyMs': latency})
@@ -179,16 +192,6 @@ class SemanticOnPolicyAdapter(OnPolicyAdapter):  # pragma: no cover minimal logi
                 else 0.0
             )
             logger.store({'Semantics/EmbedSuccessRate': rate})
-            # Re-log clip readiness & status at end (in case lazy init changes)
-            clip_ready = int(getattr(self._semantic_manager, '_clip_ready', False))
-            logger.store({'Semantics/Debug/ClipReady': clip_ready})
-            status = getattr(self._semantic_manager, '_clip_status', 'unknown')
-            code = 1 if status.startswith('ok') else (-1 if status.startswith('load_error') else 0)
-            logger.store({'Semantics/Debug/ClipStatus': float(code)})
-            try:
-                logger.log(f"CLIP Status End: {status}")
-            except Exception:  # noqa: BLE001
-                pass
             # final debug counters
             logger.store({
                 'Semantics/Debug/EmbedAttempts': float(self._embed_attempts),

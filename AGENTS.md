@@ -11,9 +11,13 @@ Core Components:
 * (Scaffold) Risk head MLP for future auxiliary prediction & modulation.
 Flow: env render(s) → CLIP embedding(s) → safe vs unsafe centroid cosine margin → annealed beta(t) → shaping reward addition.
 
+Shaping Modes:
+* Additive: r' = r + beta * margin (normalized/scaled & clipped).
+* Potential-based (preferred for neutrality): r' = r + beta * (gamma * phi(s') - phi(s)), with phi(s)=processed margin. Toggle via `potential_enable`.
+
 ## 2. Key Files
 | File | Role |
-|------|------|
+|------|------|`
 | `omnisafe/algorithms/on_policy/naive_lagrange/ppo_lag_semantic.py` | Registers semantic config & adapter swap |
 | `omnisafe/common/semantics/semantic_manager.py` | Core semantics: CLIP, centroids, shaping, risk buffers, batching |
 | `omnisafe/adapter/semantic_onpolicy_adapter.py` | Rollout with capture & per‑env shaping |
@@ -40,23 +44,37 @@ CLIP Safety: bfloat16→fp16→fp32 fallback; safetensors enforced; status logge
 | Risk head | Planned same as CLIP | Matches CLIP | Hook minimal now |
 
 ## 5. Logging Keys
-Semantic: `Semantics/Shaping`, `Semantics/RawReward`, `Semantics/EmbedLatencyMs`, `Semantics/EmbedSuccessRate`, `Semantics/Debug/EmbedAttempts`, `Semantics/Debug/EmbedSuccess`, `Semantics/Debug/ClipReady`, `Semantics/Debug/ClipStatus`.
-Risk (registered; pending population): `Risk/Loss`, `Risk/PredMean`, `Risk/TargetMean`, `Risk/Corr`.
+Semantic core:
+* `Semantics/Shaping` – shaping term applied (aggregated)
+* `Semantics/RawReward` – environment reward pre-shaping
+* `Semantics/ShapingRewardRatio` – mean shaping / mean raw reward (curriculum influence)
+* `Semantics/ShapingStd` – per-capture shaping std (0 if scalar path)
+* `Semantics/EmbedLatencyMs` – per-frame latency (avg for batch)
+* `Semantics/EmbedSuccessRate`, `Semantics/Debug/EmbedAttempts`, `Semantics/Debug/EmbedSuccess` – embedding reliability
+* `Semantics/RawMargin`, `Semantics/NormMargin` – last raw & normalized cosine margins
+* `Semantics/Beta` – current shaping coefficient
+* `Semantics/ClampFrac` – fraction of historical normalized margins clipped
+* `Semantics/CaptureCount` – number of capture events
+* `Semantics/CaptureIntervalEffective` – steps since last capture
+
+Risk (active): `Risk/Loss`, `Risk/PredMean`, `Risk/TargetMean`, `Risk/Corr`.
+
+Removed legacy: `Semantics/Debug/ClipReady`, `Semantics/Debug/ClipStatus`.
 
 ## 6. Limitations
-1. No temporal (cross‑step) embedding batching; spatial only.
-2. Risk head training & metrics not yet active.
-3. Shaping distribution (std/min/max) not logged (only mean).
-4. Per‑env render may replicate one frame if true multi‑render unsupported.
-5. Lacks tests for margin normalization, dtype fallback, anneal schedule, risk correlation.
+1. No temporal batching (spatial only; temporal pending justification).
+2. Risk targets are truncated forward sums (episode-aware reverse cumulative pending).
+3. Per-capture shaping std not logged (only epoch aggregation for shaping mean/min/max).
+4. Some vector envs may yield a single composite frame (replication heuristic used).
+5. Missing unit tests: margin normalization toggle, beta schedule edges, risk correlation synthetic.
 
 ## 7. Planned Enhancements (Priority)
-1. Implement risk head training loop (mini‑batch updates; populate risk metrics).
-2. Add batch diagnostics: shaping std/min/max and batch size metric.
-3. Lagrange modulation via risk quantile gating (`modulation_scale`).
-4. Temporal or async embedding micro‑batching.
-5. Expanded unit tests (margin normalization, beta schedule, dtype fallback, risk correlation, shaping parity disabled batching).
-6. Prompt adaptation strategies (dynamic weighting / refresh).
+1. Improved risk targets (episode-aware reverse discounted) & normalization option.
+2. Lagrange modulation via risk quantile gating.
+3. Shaping distribution (per-capture std) & batch size logging.
+4. Unit tests: beta schedule, margin scaling toggle, risk correlation synthetic, batching parity.
+5. Prompt adaptation / dynamic refresh.
+6. Temporal/async embedding (only if profiling bottleneck).
 
 ## 8. Troubleshooting
 | Issue | Diagnostic | Resolution |
@@ -78,6 +96,10 @@ Risk (registered; pending population): `Risk/Loss`, `Risk/PredMean`, `Risk/Targe
 | risk_enable | Enable risk head | False |
 | beta_start | Initial shaping coefficient | 0.05 |
 | beta_end_step_fraction | Anneal fraction of total steps | 0.4 |
+| margin_norm_enable | Enable z-normalization of margin | True |
+| margin_scale | Multiplicative scale on raw margin | 1.0 |
+| potential_enable | Use potential-based shaping instead of additive | False |
+| risk_lr | Risk head learning rate | 1e-3 |
 | risk_horizon | Discount horizon for risk target | 64 |
 | discount | Risk target discount | 0.99 |
 | window_size | Risk buffer size | 2048 |
@@ -97,14 +119,15 @@ Risk (registered; pending population): `Risk/Loss`, `Risk/PredMean`, `Risk/Targe
 * Risk head depth & regularization tuning postponed until baseline predictive utility observed.
 
 ## 12. Immediate TODOs
-- [ ] Populate & train risk head; log risk metrics.
-- [ ] Add shaping distribution & batch size logging.
-- [ ] Unit tests: margin normalization & beta schedule correctness.
-- [ ] Central synthetic frame fallback helper (avoid ad‑hoc patches).
+- [ ] Improved risk targets (episode-aware reverse discounted).
+- [ ] Lagrange modulation quantile experiment.
+- [ ] Shaping per-capture std & batch size metric.
+- [ ] Unit tests (beta schedule, margin scaling, risk correlation synthetic).
+- [ ] Synthetic frame fallback helper.
 
 ## 13. Version Stamp
-* Thesis Document: v1.5
-* Agent Summary: v1.2 (spatial batching integrated; updated TODOs & limitations)
+* Thesis Document: v1.7 (potential shaping + shaping ratio/std)
+* Agent Summary: v1.4 (adds potential-based shaping + shaping influence metrics)
 
 ---
 For continuity—update incrementally with each semantic feature change (do not delete).

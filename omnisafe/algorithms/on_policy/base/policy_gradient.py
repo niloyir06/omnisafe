@@ -190,9 +190,10 @@ class PolicyGradient(BaseAlgo):
         self._logger.torch_save()
 
         # Core metrics
-        self._logger.register_key('Metrics/EpRet', window_length=self._cfgs.logger_cfgs.window_lens)
-        self._logger.register_key('Metrics/EpCost', window_length=self._cfgs.logger_cfgs.window_lens)
-        self._logger.register_key('Metrics/EpLen', window_length=self._cfgs.logger_cfgs.window_lens)
+        wl = self._cfgs.logger_cfgs.window_lens
+        self._logger.register_key('Metrics/EpRet', window_length=wl)
+        self._logger.register_key('Metrics/EpCost', window_length=wl)
+        self._logger.register_key('Metrics/EpLen', window_length=wl)
 
         # Training stats
         self._logger.register_key('Train/Epoch')
@@ -228,12 +229,22 @@ class PolicyGradient(BaseAlgo):
         self._logger.register_key('Semantics/EmbedSuccessRate')
         self._logger.register_key('Semantics/Debug/EmbedAttempts')
         self._logger.register_key('Semantics/Debug/EmbedSuccess')
-        self._logger.register_key('Semantics/Debug/ClipReady')
-        self._logger.register_key('Semantics/Debug/ClipStatus')
         self._logger.register_key('Risk/Loss')
         self._logger.register_key('Risk/PredMean')
         self._logger.register_key('Risk/TargetMean')
         self._logger.register_key('Risk/Corr')
+        self._logger.register_key('Risk/LR')
+
+        # Semantic telemetry (raw margin diagnostics & schedule)
+        win = wl
+        self._logger.register_key('Semantics/RawMargin', min_and_max=True, window_length=win)
+        self._logger.register_key('Semantics/NormMargin', min_and_max=True, window_length=win)
+        self._logger.register_key('Semantics/Beta', window_length=win)
+        self._logger.register_key('Semantics/ClampFrac', window_length=win)
+        self._logger.register_key('Semantics/CaptureCount', window_length=win)
+        self._logger.register_key('Semantics/CaptureIntervalEffective', window_length=win)
+        self._logger.register_key('Semantics/ShapingRewardRatio', window_length=win)
+        self._logger.register_key('Semantics/ShapingStd', window_length=win)
 
         # Environment-specific keys
         for env_spec_key in self._env.env_spec_keys:
@@ -423,7 +434,9 @@ class PolicyGradient(BaseAlgo):
                             self._risk_head = self._risk_head.to(dtype=clip_dtype)
                     except Exception:  # noqa: BLE001
                         pass
-                    self._risk_opt = torch.optim.Adam(self._risk_head.parameters(), lr=1e-3)
+                    # Use configured learning rate if provided (fall back to 1e-3)
+                    risk_lr = getattr(sem_cfg, 'risk_lr', 1e-3)
+                    self._risk_opt = torch.optim.Adam(self._risk_head.parameters(), lr=risk_lr)
                 batch_embs = self._semantic_manager.get_recent_risk_batch()  # type: ignore[attr-defined]
                 if batch_embs is not None and batch_embs.shape[0] > 8:
                     risk_device = next(self._risk_head.parameters()).device
@@ -438,13 +451,26 @@ class PolicyGradient(BaseAlgo):
                     costs = costs[-L:]
                     horizon = getattr(sem_cfg, 'risk_horizon', 64)
                     gamma = getattr(sem_cfg, 'discount', 0.99)
+                    # Reverse discounted cumulative (episode-unaware here; window-limited) for better target consistency.
                     with torch.no_grad():
-                        targets_list = []
-                        for j in range(L):
-                            rng = costs[j:j+horizon]
-                            disc = torch.tensor([gamma ** k for k in range(len(rng))], device=costs.device)
-                            targets_list.append((rng * disc).sum())
-                        targets = torch.stack(targets_list)
+                        # Take last L costs slice to align with embs already truncated. Compute reverse discounted cumulative up to horizon.
+                        slice_costs = costs[-L:]
+                        targets = torch.zeros_like(slice_costs)
+                        running = torch.zeros(1, device=costs.device)
+                        steps = 0
+                        # Iterate backwards to produce potential-like cost-to-go approximation.
+                        for idx in range(L - 1, -1, -1):
+                            running = slice_costs[idx] + gamma * running
+                            targets[idx] = running
+                            steps += 1
+                            if steps >= horizon:
+                                running = running - (gamma ** (horizon - 1)) * slice_costs[min(idx + horizon - 1, L - 1)]  # safety bound; horizon clamp
+                        # Clip to horizon by recomputing forward-limited discounted sums (more precise) if horizon < L
+                        if horizon < L:
+                            disc_vec = torch.tensor([gamma ** k for k in range(horizon)], device=costs.device)
+                            for j in range(L):
+                                rng = slice_costs[j:j + horizon]
+                                targets[j] = (rng * disc_vec[: rng.shape[0]]).sum()
                     preds = self._risk_head(embs)
                     loss = torch.nn.functional.smooth_l1_loss(preds.float(), targets.float())
                     self._risk_opt.zero_grad()
@@ -465,6 +491,12 @@ class PolicyGradient(BaseAlgo):
                         'Risk/PredMean': preds.mean().item(),
                         'Risk/TargetMean': targets.mean().item(),
                     }
+                    # Optionally log lr used
+                    if hasattr(self, '_risk_opt'):
+                        for pg in self._risk_opt.param_groups:
+                            if 'lr' in pg:
+                                log_dict['Risk/LR'] = pg['lr']
+                                break
                     if corr_val is not None:
                         log_dict['Risk/Corr'] = corr_val
                     self._logger.store(log_dict)

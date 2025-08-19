@@ -143,12 +143,14 @@ defaults:
     shaping_enable: False
     # enable auxiliary risk head training
     risk_enable: False
+    # learning rate for auxiliary risk head (if enabled)
+    risk_lr: 0.001
     # enable (future) modulation of constraint updates using predicted risk
     modulation_enable: False
     # initial shaping coefficient
-    beta_start: 0.05
+    beta_start: 0.15
     # fraction of total steps over which beta anneals to 0
-    beta_end_step_fraction: 0.4
+    beta_end_step_fraction: 0.6
     # horizon length (steps) for truncated discounted cost target
     risk_horizon: 64
     # discount used for risk target accumulation
@@ -161,10 +163,26 @@ defaults:
     slope: 5.0
     # max stored embeddings/costs window (risk buffer)
     window_size: 2048
+    # window length for running mean/std of semantic margin (normalization)
+    norm_window: 1000
+    # enable z-normalization of semantic margin before clipping
+    margin_norm_enable: True
+    # scale factor applied to raw (safe-unsafe) margin prior to normalization/clipping
+    margin_scale: 1.0
+    # enable potential-based shaping (beta * (gamma * phi_next - phi_prev)); else additive beta*clipped_norm
+    potential_enable: True
     # prompts describing safe scenes
-    safe_prompts: ["clear path to goal", "centered trajectory", "ample clearance"]
+    safe_prompts: [
+        "red car moving toward green goal",
+        "clear path ahead to green goal",
+        "red car aligned safely avoiding obstacles",
+    ]
     # prompts describing unsafe scenes
-    unsafe_prompts: ["imminent collision", "tight near-obstacle turn", "risky close pass"]
+    unsafe_prompts: [
+        "red car near purple obstacle collision",
+        "red car pushing into blue cube hazard",
+        "blocked path crowded with purple obstacles",
+    ]
     # enable spatial batching of embeddings across all parallel envs (per capture step)
     batch_across_envs: True
     # hard cap on batch size (frames) passed to CLIP each capture (protect VRAM)

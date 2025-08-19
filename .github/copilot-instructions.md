@@ -27,8 +27,8 @@ Concise, project‑specific rules (semantic PPOLagSem fork). Keep edits small, p
 - Parity contract: with `enable=False` no semantic side effects (must remain true after changes).
 
 ## 5. Logging Keys
-- Semantics: `Semantics/Shaping`, `RawReward`, `EmbedLatencyMs`, `EmbedSuccessRate`, `Debug/ClipReady`, `Debug/ClipStatus`, `Debug/EmbedAttempts`, `Debug/EmbedSuccess`.
-- Future Risk: `Risk/Loss`, `Risk/PredMean`, `Risk/TargetMean`, `Risk/Corr` (add only when implemented).
+- Semantics: `Semantics/Shaping`, `Semantics/RawReward`, `Semantics/EmbedLatencyMs`, `Semantics/EmbedSuccessRate`, `Semantics/Debug/EmbedAttempts`, `Semantics/Debug/EmbedSuccess`, `Semantics/RawMargin`, `Semantics/NormMargin`, `Semantics/Beta`, `Semantics/ClampFrac`, `Semantics/CaptureCount`, `Semantics/CaptureIntervalEffective`.
+- Risk: `Risk/Loss`, `Risk/PredMean`, `Risk/TargetMean`, `Risk/Corr`.
 
 ## 6. Devices & Dtypes
 - CLIP on `model_device`; embeddings/centroids moved to `host_device` (GPU keep reduced precision; CPU cast fp32).
