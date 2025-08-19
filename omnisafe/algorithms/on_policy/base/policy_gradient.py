@@ -172,6 +172,7 @@ class PolicyGradient(BaseAlgo):
         | FPS                   | Frames per second of the epoch.                                      |
         +-----------------------+----------------------------------------------------------------------+
         """
+        # Original explicit registration style preserved; only additional semantic/risk keys appended.
         self._logger = Logger(
             output_dir=self._cfgs.logger_cfgs.log_dir,
             exp_name=self._cfgs.exp_name,
@@ -181,27 +182,19 @@ class PolicyGradient(BaseAlgo):
             config=self._cfgs,
         )
 
-        what_to_save: dict[str, Any] = {}
-        what_to_save['pi'] = self._actor_critic.actor
+        what_to_save: dict[str, Any] = {'pi': self._actor_critic.actor}
         if self._cfgs.algo_cfgs.obs_normalize:
             obs_normalizer = self._env.save()['obs_normalizer']
             what_to_save['obs_normalizer'] = obs_normalizer
         self._logger.setup_torch_saver(what_to_save)
         self._logger.torch_save()
 
-        self._logger.register_key(
-            'Metrics/EpRet',
-            window_length=self._cfgs.logger_cfgs.window_lens,
-        )
-        self._logger.register_key(
-            'Metrics/EpCost',
-            window_length=self._cfgs.logger_cfgs.window_lens,
-        )
-        self._logger.register_key(
-            'Metrics/EpLen',
-            window_length=self._cfgs.logger_cfgs.window_lens,
-        )
+        # Core metrics
+        self._logger.register_key('Metrics/EpRet', window_length=self._cfgs.logger_cfgs.window_lens)
+        self._logger.register_key('Metrics/EpCost', window_length=self._cfgs.logger_cfgs.window_lens)
+        self._logger.register_key('Metrics/EpLen', window_length=self._cfgs.logger_cfgs.window_lens)
 
+        # Training stats
         self._logger.register_key('Train/Epoch')
         self._logger.register_key('Train/Entropy')
         self._logger.register_key('Train/KL')
@@ -210,31 +203,41 @@ class PolicyGradient(BaseAlgo):
         self._logger.register_key('Train/LR')
         if self._cfgs.model_cfgs.actor_type == 'gaussian_learning':
             self._logger.register_key('Train/PolicyStd')
-
         self._logger.register_key('TotalEnvSteps')
 
-        # log information about actor
+        # Loss/value metrics
         self._logger.register_key('Loss/Loss_pi', delta=True)
         self._logger.register_key('Value/Adv')
-
-        # log information about critic
         self._logger.register_key('Loss/Loss_reward_critic', delta=True)
         self._logger.register_key('Value/reward')
-
         if self._cfgs.algo_cfgs.use_cost:
-            # log information about cost critic
             self._logger.register_key('Loss/Loss_cost_critic', delta=True)
             self._logger.register_key('Value/cost')
 
+        # Timing
         self._logger.register_key('Time/Total')
         self._logger.register_key('Time/Rollout')
         self._logger.register_key('Time/Update')
         self._logger.register_key('Time/Epoch')
         self._logger.register_key('Time/FPS')
 
-        # register environment specific keys
+        # Semantic & risk diagnostics
+        self._logger.register_key('Semantics/Shaping', min_and_max=True)
+        self._logger.register_key('Semantics/RawReward')
+        self._logger.register_key('Semantics/EmbedLatencyMs', min_and_max=True)
+        self._logger.register_key('Semantics/EmbedSuccessRate')
+        self._logger.register_key('Semantics/Debug/EmbedAttempts')
+        self._logger.register_key('Semantics/Debug/EmbedSuccess')
+        self._logger.register_key('Semantics/Debug/ClipReady')
+        self._logger.register_key('Semantics/Debug/ClipStatus')
+        self._logger.register_key('Risk/Loss')
+        self._logger.register_key('Risk/PredMean')
+        self._logger.register_key('Risk/TargetMean')
+        self._logger.register_key('Risk/Corr')
+
+        # Environment-specific keys
         for env_spec_key in self._env.env_spec_keys:
-            self.logger.register_key(env_spec_key)
+            self._logger.register_key(env_spec_key)
 
     def learn(self) -> tuple[float, float, float]:
         """This is main function for algorithm update.
@@ -412,30 +415,61 @@ class PolicyGradient(BaseAlgo):
                     from omnisafe.common.semantics.risk_head import SemanticRiskHead
                     example_emb = self._semantic_manager.get_recent_risk_batch()  # type: ignore[attr-defined]
                     in_dim = example_emb.shape[1] if example_emb is not None else 512
-                    self._risk_head = SemanticRiskHead(in_dim).to(self._device)
+                    risk_device = getattr(self._semantic_manager, 'model_device', self._device)  # type: ignore[attr-defined]
+                    self._risk_head = SemanticRiskHead(in_dim).to(risk_device)
+                    try:
+                        clip_dtype = next(self._semantic_manager.clip_model.parameters()).dtype  # type: ignore[attr-defined]
+                        if clip_dtype in (torch.bfloat16, torch.float16):
+                            self._risk_head = self._risk_head.to(dtype=clip_dtype)
+                    except Exception:  # noqa: BLE001
+                        pass
                     self._risk_opt = torch.optim.Adam(self._risk_head.parameters(), lr=1e-3)
                 batch_embs = self._semantic_manager.get_recent_risk_batch()  # type: ignore[attr-defined]
                 if batch_embs is not None and batch_embs.shape[0] > 8:
-                    embs = batch_embs.to(self._device)
-                    costs = torch.tensor(list(self._semantic_manager.costs), dtype=torch.float32, device=self._device)  # type: ignore[attr-defined]
+                    risk_device = next(self._risk_head.parameters()).device
+                    embs = batch_embs.to(risk_device)
+                    # Ensure dtype matches risk head (avoid Float vs BFloat16 mismatch)
+                    rh_dtype = next(self._risk_head.parameters()).dtype
+                    if embs.dtype != rh_dtype:
+                        embs = embs.to(dtype=rh_dtype)
+                    costs = torch.tensor(list(self._semantic_manager.costs), dtype=torch.float32, device=risk_device)  # type: ignore[attr-defined]
                     L = min(len(costs), embs.shape[0])
                     embs = embs[-L:]
                     costs = costs[-L:]
                     horizon = getattr(sem_cfg, 'risk_horizon', 64)
                     gamma = getattr(sem_cfg, 'discount', 0.99)
                     with torch.no_grad():
-                        targets = []
-                        for i in range(L):
-                            rng = costs[i:i+horizon]
+                        targets_list = []
+                        for j in range(L):
+                            rng = costs[j:j+horizon]
                             disc = torch.tensor([gamma ** k for k in range(len(rng))], device=costs.device)
-                            targets.append((rng * disc).sum())
-                        targets = torch.stack(targets)
+                            targets_list.append((rng * disc).sum())
+                        targets = torch.stack(targets_list)
                     preds = self._risk_head(embs)
-                    loss = torch.nn.functional.smooth_l1_loss(preds, targets)
+                    loss = torch.nn.functional.smooth_l1_loss(preds.float(), targets.float())
                     self._risk_opt.zero_grad()
                     loss.backward()
                     self._risk_opt.step()
-                    self._logger.store({'Risk/Loss': loss.item(), 'Risk/PredMean': preds.mean().item()})
+                    corr_val = None
+                    if preds.numel() > 10:
+                        p = preds.detach().flatten()
+                        t = targets.detach().flatten()
+                        if p.std() > 1e-6 and t.std() > 1e-6:
+                            try:
+                                corr_mat = torch.corrcoef(torch.stack([p, t]))
+                                corr_val = corr_mat[0, 1].item()
+                            except Exception:  # pragma: no cover
+                                corr_val = None
+                    log_dict = {
+                        'Risk/Loss': loss.item(),
+                        'Risk/PredMean': preds.mean().item(),
+                        'Risk/TargetMean': targets.mean().item(),
+                    }
+                    if corr_val is not None:
+                        log_dict['Risk/Corr'] = corr_val
+                    self._logger.store(log_dict)
+                else:
+                    self._logger.store({'Risk/Loss': 0.0, 'Risk/PredMean': 0.0, 'Risk/TargetMean': 0.0})
 
     def _update_reward_critic(self, obs: torch.Tensor, target_value_r: torch.Tensor) -> None:
         r"""Update value network under a double for loop.

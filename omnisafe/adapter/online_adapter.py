@@ -68,6 +68,9 @@ class OnlineAdapter:
         if hasattr(self._cfgs, 'env_cfgs') and self._cfgs.env_cfgs is not None:
             env_cfgs = self._cfgs.env_cfgs.todict()
 
+        # Optional render_mode injection controlled by semantic config flag
+        if 'render_mode' not in env_cfgs and hasattr(cfgs, 'semantic_cfgs'):  # type: ignore[attr-defined]
+            env_cfgs['render_mode'] = getattr(cfgs.semantic_cfgs, 'render_mode', 'rgb_array')  # type: ignore[attr-defined]
         self._env: CMDP = make(env_id, num_envs=num_envs, device=self._device, **env_cfgs)
         self._wrapper(
             obs_normalize=cfgs.algo_cfgs.obs_normalize,
@@ -77,6 +80,8 @@ class OnlineAdapter:
 
         self._eval_env: CMDP | None = None
         if self._env.need_evaluation:
+            if 'render_mode' not in env_cfgs and hasattr(cfgs, 'semantic_cfgs'):  # type: ignore[attr-defined]
+                env_cfgs['render_mode'] = getattr(cfgs.semantic_cfgs, 'render_mode', 'rgb_array')  # type: ignore[attr-defined]
             self._eval_env = make(env_id, num_envs=1, device=self._device, **env_cfgs)
             self._wrapper_eval(obs_normalize=cfgs.algo_cfgs.obs_normalize)
 
@@ -241,6 +246,10 @@ class OnlineAdapter:
     @property
     def env_spec_keys(self) -> list[str]:
         """Return the environment specification log."""
-        if hasattr(self._env, 'env_spec_log'):
-            return list(self._env.env_spec_log.keys())
-        return []
+        spec = getattr(self._env, 'env_spec_log', None)
+        if spec is None:
+            return []
+        try:
+            return list(spec.keys())  # type: ignore[no-any-return]
+        except Exception:  # noqa: BLE001
+            return []

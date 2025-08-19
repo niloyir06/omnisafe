@@ -30,12 +30,14 @@ class PPOLagSem(PPOLag):  # pragma: no cover simple wiring
             from omnisafe.common.semantics.semantic_manager import SemanticManager, SemanticConfig
             from omnisafe.adapter.semantic_onpolicy_adapter import SemanticOnPolicyAdapter
 
+            # Allow CLIP to live on its own device (e.g., CUDA) while policy stays on CPU or another device.
             sem_conf = SemanticConfig(
                 enable=getattr(sem_cfg, 'enable', False),
                 capture_interval=getattr(sem_cfg, 'capture_interval', 4),
                 frame_size=getattr(sem_cfg, 'frame_size', 224),
                 model_name=getattr(sem_cfg, 'model_name', 'openai/clip-vit-base-patch16'),
-                device=self._cfgs.train_cfgs.device,
+                model_device=getattr(sem_cfg, 'device', getattr(sem_cfg, 'model_device', self._cfgs.train_cfgs.device)),
+                host_device=getattr(sem_cfg, 'host_device', 'cpu'),
                 beta_start=getattr(sem_cfg, 'beta_start', 0.05),
                 beta_end_step_fraction=getattr(sem_cfg, 'beta_end_step_fraction', 0.4),
                 shaping_enable=getattr(sem_cfg, 'shaping_enable', False),
@@ -49,6 +51,9 @@ class PPOLagSem(PPOLag):  # pragma: no cover simple wiring
                 window_size=getattr(sem_cfg, 'window_size', 2048),
                 safe_prompts=getattr(sem_cfg, 'safe_prompts', []),
                 unsafe_prompts=getattr(sem_cfg, 'unsafe_prompts', []),
+                batch_across_envs=getattr(sem_cfg, 'batch_across_envs', True),
+                batch_max=getattr(sem_cfg, 'batch_max', 32),
+                oom_backoff=getattr(sem_cfg, 'oom_backoff', True),
             )
             self._semantic_manager = SemanticManager(sem_conf, self._cfgs.train_cfgs.total_steps)
             # replace env adapter keeping same env id & num envs

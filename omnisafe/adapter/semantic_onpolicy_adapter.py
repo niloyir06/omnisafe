@@ -1,7 +1,15 @@
-"""SemanticOnPolicyAdapter extends OnPolicyAdapter with frame capture & shaping."""
+"""SemanticOnPolicyAdapter extends OnPolicyAdapter with frame capture & semantic logging.
+
+Adds:
+ - Periodic frame capture & CLIP embedding.
+ - Semantic shaping reward.
+ - Progress bar (rich.track) mirroring base on-policy adapter.
+ - Clip readiness & status logging, embedding counters & latency.
+"""
 from __future__ import annotations
 
 import torch
+from rich.progress import track
 
 from omnisafe.adapter.onpolicy_adapter import OnPolicyAdapter
 from omnisafe.common.logger import Logger
@@ -13,32 +21,117 @@ from omnisafe.common.semantics.semantic_manager import SemanticManager
 class SemanticOnPolicyAdapter(OnPolicyAdapter):  # pragma: no cover minimal logic
     def __init__(self, *args, semantic_manager: SemanticManager, **kwargs) -> None:  # type: ignore[no-untyped-def]
         self._semantic_manager = semantic_manager
+        self._embed_attempts = 0
+        self._embed_success = 0
         super().__init__(*args, **kwargs)
 
     def rollout(self, steps_per_epoch: int, agent: ConstraintActorCritic, buffer: VectorOnPolicyBuffer, logger: Logger) -> None:  # type: ignore[override]
+        # Reset per-episode logging and grab initial observation
         self._reset_log()
         obs, _ = self.reset()
         capture_interval = self._semantic_manager.cfg.capture_interval
-        for step in range(steps_per_epoch):
+        # Seed success rate metric to avoid NaN before any attempts
+        if self._semantic_manager.cfg.enable:
+            logger.store({'Semantics/EmbedSuccessRate': 0.0})
+            # Log clip readiness (0/1) once at start so metric never NaNs
+            clip_ready = int(getattr(self._semantic_manager, '_clip_ready', False))
+            logger.store({'Semantics/Debug/ClipReady': clip_ready})
+            # Log status string (dtype or error) for visibility
+            status = getattr(self._semantic_manager, '_clip_status', 'unknown')
+            code = 1 if status.startswith('ok') else (-1 if status.startswith('load_error') else 0)
+            logger.store({'Semantics/Debug/ClipStatus': float(code)})
+            # Store status as text if logger supports text logging (fall back to print via logger.log)
+            try:
+                logger.log(f"CLIP Status: {status}")
+            except Exception:  # noqa: BLE001
+                pass
+        batch_mode = self._semantic_manager.cfg.batch_across_envs and getattr(self._env, 'num_envs', 1) > 1
+        for step in track(
+            range(steps_per_epoch),
+            description=f'Processing semantic rollout for epoch: {logger.current_epoch}...',
+        ):
             act, value_r, value_c, logp = agent.step(obs)
             next_obs, reward, cost, terminated, truncated, info = self.step(act)
-
-            # frame capture & embedding every interval
-            embedding = None
-            shaping = 0.0
             if self._semantic_manager.cfg.enable and (step % capture_interval == 0):
+                # Spatial batch path
+                if batch_mode:
+                    try:
+                        frames = []
+                        # Try to render once per env; fallback to single shared frame if vectorized env doesn't expose per-env render.
+                        base_frame = self._env.render()
+                        if isinstance(base_frame, list) and len(base_frame) == reward.shape[0]:  # already list of frames
+                            frames = base_frame
+                        else:
+                            # replicate same frame for all envs (best-effort)
+                            frames = [base_frame for _ in range(reward.shape[0])]
+                        self._embed_attempts += len(frames)
+                        embeddings = self._semantic_manager.maybe_compute_embeddings(frames)
+                        shapings = []
+                        success_ct = 0
+                        if self._semantic_manager.cfg.shaping_enable:
+                            for emb in embeddings:
+                                if emb is not None:
+                                    success_ct += 1
+                                    shapings.append(self._semantic_manager.shaping_term(emb))
+                                else:
+                                    shapings.append(0.0)
+                        else:
+                            for emb in embeddings:
+                                if emb is not None:
+                                    success_ct += 1
+                                shapings.append(0.0)
+                        self._embed_success += success_ct
+                        shaping_tensor = torch.as_tensor(shapings, device=reward.device, dtype=reward.dtype)
+                        reward = reward + shaping_tensor
+                        # logging (aggregate shaping mean)
+                        logger.store({'Semantics/Shaping': shaping_tensor.mean()})
+                        latency = self._semantic_manager.last_embed_latency_ms if success_ct > 0 else 0.0
+                        logger.store({'Semantics/EmbedLatencyMs': latency})
+                        logger.store({
+                            'Semantics/Debug/EmbedAttempts': float(self._embed_attempts),
+                            'Semantics/Debug/EmbedSuccess': float(self._embed_success),
+                        })
+                        # record risk data (use per-env mean cost element-wise) cost is vector length num_envs
+                        mean_costs = cost.detach().cpu().tolist()
+                        self._semantic_manager.record_multi_step(embeddings, mean_costs)
+                    except Exception:  # noqa: BLE001
+                        self._semantic_manager.advance_step()
+                else:
+                    # Legacy single-frame path
+                    embedding = None
+                    shaping = 0.0
+                    try:
+                        frame = self._env.render()
+                        self._embed_attempts += 1
+                        embedding = self._semantic_manager.maybe_compute_embedding(frame)
+                        if embedding is not None:
+                            self._embed_success += 1
+                            if self._semantic_manager.cfg.shaping_enable:
+                                shaping = self._semantic_manager.shaping_term(embedding)
+                        logger.store({
+                            'Semantics/Debug/EmbedAttempts': float(self._embed_attempts),
+                            'Semantics/Debug/EmbedSuccess': float(self._embed_success),
+                        })
+                    except Exception:  # noqa: BLE001
+                        pass
+                    if shaping != 0.0:
+                        reward = reward + shaping
+                    self._semantic_manager.record_step(embedding, float(cost.mean().item()))
+                    latency = self._semantic_manager.last_embed_latency_ms if embedding is not None else 0.0
+                    logger.store({'Semantics/EmbedLatencyMs': latency})
+                    logger.store({'Semantics/Shaping': torch.as_tensor(shaping)})
+            else:
+                # No capture this step: still advance schedule counter for semantic annealing
+                if self._semantic_manager.cfg.enable:
+                    self._semantic_manager.advance_step()
+                    logger.store({'Semantics/Shaping': torch.as_tensor(0.0)})
+                    logger.store({'Semantics/EmbedLatencyMs': 0.0})
+            if self._semantic_manager.cfg.enable:
                 try:
-                    frame = self._env.render()  # assuming safety-gymnasium returns RGB array
-                    embedding = self._semantic_manager.maybe_compute_embedding(frame)
-                    shaping = self._semantic_manager.shaping_term(embedding) if embedding is not None else 0.0
-                except Exception:  # noqa: BLE001
+                    raw_val = reward.mean() if hasattr(reward, 'mean') else torch.as_tensor(reward)
+                    logger.store({'Semantics/RawReward': raw_val})
+                except Exception:  # pragma: no cover
                     pass
-            if shaping != 0.0:
-                reward = reward + shaping
-                logger.store({'Semantics/Shaping': torch.as_tensor(shaping)})
-            if embedding is not None:
-                logger.store({'Semantics/EmbedLatencyMs': self._semantic_manager.last_embed_latency_ms})
-            self._semantic_manager.record_step(embedding, float(cost.mean().item()))
 
             self._log_value(reward=reward, cost=cost, info=info)
             if self._cfgs.algo_cfgs.use_cost:
@@ -57,6 +150,12 @@ class SemanticOnPolicyAdapter(OnPolicyAdapter):  # pragma: no cover minimal logi
             obs = next_obs
 
             epoch_end = step >= steps_per_epoch - 1
+            if epoch_end:
+                num_dones = int(terminated.contiguous().sum())
+                if self._env.num_envs - num_dones:
+                    logger.log(
+                        f'\nWarning: trajectory cut off when rollout by epoch in {self._env.num_envs - num_dones} of {self._env.num_envs} environments.',
+                    )
             for idx, (done, time_out) in enumerate(zip(terminated, truncated)):
                 if epoch_end or done or time_out:
                     last_value_r = torch.zeros(1)
@@ -72,3 +171,26 @@ class SemanticOnPolicyAdapter(OnPolicyAdapter):  # pragma: no cover minimal logi
                         self._log_metrics(logger, idx)
                         self._reset_log(idx)
                     buffer.finish_path(last_value_r, last_value_c, idx)
+
+        if self._semantic_manager.cfg.enable:
+            rate = (
+                float(self._embed_success) / float(self._embed_attempts)
+                if self._embed_attempts > 0
+                else 0.0
+            )
+            logger.store({'Semantics/EmbedSuccessRate': rate})
+            # Re-log clip readiness & status at end (in case lazy init changes)
+            clip_ready = int(getattr(self._semantic_manager, '_clip_ready', False))
+            logger.store({'Semantics/Debug/ClipReady': clip_ready})
+            status = getattr(self._semantic_manager, '_clip_status', 'unknown')
+            code = 1 if status.startswith('ok') else (-1 if status.startswith('load_error') else 0)
+            logger.store({'Semantics/Debug/ClipStatus': float(code)})
+            try:
+                logger.log(f"CLIP Status End: {status}")
+            except Exception:  # noqa: BLE001
+                pass
+            # final debug counters
+            logger.store({
+                'Semantics/Debug/EmbedAttempts': float(self._embed_attempts),
+                'Semantics/Debug/EmbedSuccess': float(self._embed_success),
+            })

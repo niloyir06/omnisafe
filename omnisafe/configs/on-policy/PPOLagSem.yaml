@@ -1,79 +1,174 @@
-# PPOLagSem config (copy-minimal of PPOLag for semantic variant)
+## Copyright 2023 OmniSafe Team. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
+#
+# PPOLagSem configuration: PPO-Lagrangian with optional semantic (CLIP) shaping & risk head.
+# Mirrors PPOLag.yaml fields 1:1 plus an expanded semantic_cfgs block. All extra parameters are
+# strictly additive (disabled by default) so baseline parity is preserved when enable=False.
 
 defaults:
+  # seed for random number generator
   seed: 0
   train_cfgs:
+    # device to use for training, options: cpu, cuda, cuda:0, cuda:0,1, etc.
     device: cpu
-    torch_threads: 16
+    # number of threads for torch (lower when many env processes to avoid oversubscription)
+    torch_threads: 1
+    # number of vectorized environments
     vector_env_nums: 1
+    # number of parallel agents (A3C-style); keep 1 unless multi-agent replication implemented
     parallel: 1
+    # total number of steps to train
     total_steps: 10000000
   algo_cfgs:
+    # number of steps to roll out before each update (per epoch)
     steps_per_epoch: 20000
+    # number of PPO epochs (passes) per batch
     update_iters: 40
+    # mini-batch size per update iteration
     batch_size: 64
+    # target KL divergence threshold for early stopping
     target_kl: 0.02
+    # entropy bonus coefficient
     entropy_coef: 0.0
+    # normalize reward signal
     reward_normalize: False
+    # normalize cost signal
     cost_normalize: False
+    # normalize observations
     obs_normalize: True
+    # stop updating early if KL > target_kl
     kl_early_stop: True
+    # enable gradient clipping by global norm
     use_max_grad_norm: True
+    # gradient clipping threshold
     max_grad_norm: 40.0
+    # apply L2 regularization to critic parameters
     use_critic_norm: True
+    # coefficient for critic L2 norm penalty
     critic_norm_coef: 0.001
+    # reward discount factor
     gamma: 0.99
+    # cost discount factor
     cost_gamma: 0.99
+    # lambda for reward GAE
     lam: 0.95
+    # lambda for cost GAE
     lam_c: 0.95
+    # PPO clip ratio
     clip: 0.2
+    # advantage estimation method (gae|retrace)
     adv_estimation_method: gae
+    # standardize reward advantages
     standardized_rew_adv: True
+    # standardize cost advantages
     standardized_cost_adv: True
+    # penalty coefficient (unused in pure Lagrangian but kept for compatibility)
     penalty_coef: 0.0
+    # whether to treat cost constraint explicitly
     use_cost: True
   logger_cfgs:
+    # use wandb for logging
     use_wandb: False
+    # wandb project name
     wandb_project: omnisafe
+    # use tensorboard for logging
     use_tensorboard: True
+    # save model frequency (epochs)
     save_model_freq: 100
+    # logging output directory
     log_dir: "./runs"
+    # rolling window for episodic stats
     window_lens: 100
   model_cfgs:
+    # weight initialization mode
     weight_initialization_mode: "kaiming_uniform"
+    # actor type (gaussian | gaussian_learning)
     actor_type: gaussian_learning
+    # linear learning rate decay over training
     linear_lr_decay: True
+    # exploration noise anneal (for gaussian_learning)
     exploration_noise_anneal: False
+    # initial and final std range for gaussian_learning actor
     std_range: [0.5, 0.1]
     actor:
+      # hidden layer sizes
       hidden_sizes: [64, 64]
+      # activation function
       activation: tanh
+      # learning rate
       lr: 0.0003
     critic:
+      # hidden layer sizes
       hidden_sizes: [64, 64]
+      # activation function
       activation: tanh
+      # learning rate
       lr: 0.0003
   lagrange_cfgs:
+    # tolerance (upper bound) on expected discounted cost
     cost_limit: 25.0
+    # initial Lagrange multiplier value
     lagrangian_multiplier_init: 0.001
+    # learning rate for multiplier update
     lambda_lr: 0.035
+    # optimizer used for multiplier parameter
     lambda_optimizer: "Adam"
   env_cfgs: {}
   semantic_cfgs:
+    # master enable switch for semantics (False = pure PPOLag parity)
     enable: False
+    # embed every N environment steps (controls CLIP call frequency)
     capture_interval: 4
+    # image side length (CLIP expects 224 for ViT base variants)
     frame_size: 224
+    # HuggingFace model id for CLIP
     model_name: "openai/clip-vit-base-patch16"
+    # device for CLIP forward pass (can differ from policy device)
+    model_device: cpu
+    # device where centroids & returned embeddings are stored (buffers)
+    host_device: cpu
+    # enable reward shaping using semantic margin
     shaping_enable: False
+    # enable auxiliary risk head training
     risk_enable: False
+    # enable (future) modulation of constraint updates using predicted risk
     modulation_enable: False
+    # initial shaping coefficient
     beta_start: 0.05
+    # fraction of total steps over which beta anneals to 0
     beta_end_step_fraction: 0.4
+    # horizon length (steps) for truncated discounted cost target
     risk_horizon: 64
+    # discount used for risk target accumulation
     discount: 0.99
+    # modulation scaling factor (future use)
     alpha_modulation: 2.0
+    # percentile threshold for modulation gating
     threshold_percentile: 60
+    # slope term used in logistic modulation shaping
     slope: 5.0
+    # max stored embeddings/costs window (risk buffer)
     window_size: 2048
+    # prompts describing safe scenes
     safe_prompts: ["clear path to goal", "centered trajectory", "ample clearance"]
+    # prompts describing unsafe scenes
     unsafe_prompts: ["imminent collision", "tight near-obstacle turn", "risky close pass"]
+    # enable spatial batching of embeddings across all parallel envs (per capture step)
+    batch_across_envs: True
+    # hard cap on batch size (frames) passed to CLIP each capture (protect VRAM)
+    batch_max: 32
+    # on CUDA OOM during batch embed, recursively halve batch and retry
+    oom_backoff: True
+    # Set batch_across_envs False to revert to legacy single-frame embedding path.

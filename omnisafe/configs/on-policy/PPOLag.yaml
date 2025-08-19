@@ -136,6 +136,10 @@ defaults:
     capture_interval: 4
     frame_size: 224
     model_name: "openai/clip-vit-base-patch16"
+    # device on which the CLIP semantic model runs (can be different from train_cfgs.device)
+    model_device: cpu
+    # device to host returned embeddings & centroids (usually cpu); buffers stored here
+    host_device: cpu
     shaping_enable: False
     risk_enable: False
     modulation_enable: False
