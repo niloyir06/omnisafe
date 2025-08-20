@@ -145,6 +145,8 @@ defaults:
     risk_enable: False
     # learning rate for auxiliary risk head (if enabled)
     risk_lr: 0.001
+    # episode-aware masking for risk targets (reset discounted accumulation at terminals)
+    risk_episode_mask_enable: True
     # enable (future) modulation of constraint updates using predicted risk
     modulation_enable: False
     # initial shaping coefficient

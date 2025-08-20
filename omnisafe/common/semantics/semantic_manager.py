@@ -38,6 +38,8 @@ class SemanticConfig:
     risk_lr: float = 1e-3
     risk_horizon: int = 64
     discount: float = 0.99
+    # Episode-aware masking for risk targets (reset at terminals)
+    risk_episode_mask_enable: bool = True
     alpha_modulation: float = 2.0
     threshold_percentile: int = 60
     slope: float = 5.0
@@ -71,6 +73,7 @@ class SemanticManager:
     unsafe_centroid: Optional[torch.Tensor]
     embeddings: Deque[torch.Tensor]
     costs: Deque[float]
+    dones: Deque[bool]
     _margins: Deque[float]
 
     def __init__(self, cfg: SemanticConfig, total_steps: int) -> None:
@@ -95,6 +98,7 @@ class SemanticManager:
         self.unsafe_centroid = None
         self.embeddings = deque(maxlen=self.cfg.window_size)
         self.costs = deque(maxlen=self.cfg.window_size)
+        self.dones = deque(maxlen=self.cfg.window_size)
         self._margins = deque(maxlen=self.cfg.norm_window)
         self._load_clip_and_prompts()
         # Debug / telemetry fields
@@ -290,7 +294,7 @@ class SemanticManager:
         prog = self.global_step / steps_end
         return self.cfg.beta_start * 0.5 * (1 + torch.cos(torch.tensor(prog * 3.1415926535))).item()
 
-    def record_step(self, embedding: Optional[torch.Tensor], cost: float) -> None:
+    def record_step(self, embedding: Optional[torch.Tensor], cost: float, done: bool = False) -> None:
         if embedding is not None and self.cfg.risk_enable:
             # Keep embedding on host_device; if host is GPU we avoid cpu sync.
             emb_store = embedding.detach()
@@ -298,15 +302,19 @@ class SemanticManager:
                 emb_store = emb_store.cpu()
             self.embeddings.append(emb_store)
             self.costs.append(cost)
+            self.dones.append(done)
         self.global_step += 1
 
-    def record_multi_step(self, embeddings: List[Optional[torch.Tensor]], costs: List[float]) -> None:
+    def record_multi_step(self, embeddings: List[Optional[torch.Tensor]], costs: List[float], dones: Optional[List[bool]] = None) -> None:
         """Record multiple (embedding, cost) pairs for a single environment step.
 
         Increments global_step exactly once to maintain shaping schedule consistency.
         """
         if self.cfg.risk_enable:
-            for emb, c in zip(embeddings, costs):
+            if dones is None:
+                dones = [False] * len(costs)
+            filtered_dones: List[bool] = []
+            for emb, c, d in zip(embeddings, costs, dones):
                 if emb is None:
                     continue
                 emb_store = emb.detach()
@@ -314,6 +322,9 @@ class SemanticManager:
                     emb_store = emb_store.cpu()
                 self.embeddings.append(emb_store)
                 self.costs.append(c)
+                filtered_dones.append(d)
+            for d in filtered_dones:
+                self.dones.append(d)
         self.global_step += 1
 
     def advance_step(self) -> None:
@@ -324,6 +335,49 @@ class SemanticManager:
         if not self.embeddings:
             return None
         return torch.stack(list(self.embeddings), dim=0)
+
+    def build_episode_masked_targets(self, gamma: float, horizon: int) -> Optional[torch.Tensor]:
+        """Episode-aware discounted cost targets with horizon cap.
+
+        Resets accumulation after terminal states using recorded done flags.
+        """
+        if not self.embeddings or not self.costs:
+            return None
+        costs = torch.tensor(list(self.costs), dtype=torch.float32)
+        dones_list = list(self.dones)
+        # Align length (legacy entries may lack dones; assume False)
+        if len(dones_list) < len(costs):
+            pad = [False] * (len(costs) - len(dones_list))
+            dones_list = pad + dones_list
+        L = len(costs)
+        targets = torch.zeros(L, dtype=torch.float32)
+        # Backward pass resetting at terminals
+        running = 0.0
+        look = 0
+        for i in range(L - 1, -1, -1):
+            if dones_list[i]:
+                running = 0.0
+                look = 0
+            if look >= horizon:
+                running = 0.0
+                look = 0
+            running = costs[i].item() + gamma * running
+            targets[i] = running
+            look += 1
+        # Forward refinement for strict horizon & terminal stop
+        if horizon < L:
+            pow_cache = torch.tensor([gamma ** k for k in range(horizon)], dtype=torch.float32)
+            for i in range(L):
+                acc = 0.0
+                for k in range(horizon):
+                    j = i + k
+                    if j >= L:
+                        break
+                    acc += pow_cache[k] * costs[j].item()
+                    if dones_list[j]:
+                        break
+                targets[i] = acc
+        return targets
 
     def estimated_mean_risk(self, risk_head: Optional[torch.nn.Module]) -> Optional[float]:
         if not (risk_head and self.embeddings):
@@ -336,13 +390,47 @@ class SemanticManager:
     def modulation_scale(self, risk_head: Optional[torch.nn.Module]) -> Optional[float]:
         if not (self.cfg.modulation_enable and risk_head and self.embeddings):
             return None
+        def _safe_return(val: float) -> float:
+            # Ensure final value finite and positive
+            if not (val > 0) or not torch.isfinite(torch.tensor(val)):
+                return 1.0
+            return float(val)
         with torch.no_grad():
-            embs = torch.stack(list(self.embeddings), dim=0).to(next(risk_head.parameters()).device)
-            preds = risk_head(embs).flatten()
+            try:
+                embs = torch.stack(list(self.embeddings), dim=0).to(next(risk_head.parameters()).device)
+                preds = risk_head(embs).flatten()
+            except Exception:
+                return 1.0
+            # Filter out non-finite predictions
+            finite_mask = torch.isfinite(preds)
+            preds = preds[finite_mask]
             if preds.numel() < 10:
                 return 1.0
-            perc = torch.quantile(preds, self.cfg.threshold_percentile / 100.0)
-            mean_pred = preds.mean()
-            slope_scale = (perc / self.cfg.slope) if abs(perc.item()) > 1e-6 else 1.0
-            gate = torch.sigmoid((mean_pred - perc) / (slope_scale + 1e-8))
-            return 1.0 / (1.0 + self.cfg.alpha_modulation * gate.item())
+            # Quantile & mean (guard against NaN)
+            try:
+                q_level = float(self.cfg.threshold_percentile) / 100.0
+                q_level = min(max(q_level, 0.0), 1.0)
+                perc = torch.quantile(preds, q_level)
+                mean_pred = preds.mean()
+            except Exception:
+                return 1.0
+            if not (torch.isfinite(perc) and torch.isfinite(mean_pred)):
+                return 1.0
+            slope = float(getattr(self.cfg, 'slope', 5.0) or 0.0)
+            if slope <= 0:
+                slope = 5.0  # fallback default
+            if abs(perc.item()) > 1e-6:
+                slope_scale = perc / slope
+            else:
+                slope_scale = torch.tensor(1.0, device=preds.device)
+            if not torch.isfinite(slope_scale):
+                slope_scale = torch.tensor(1.0, device=preds.device)
+            diff = mean_pred - perc
+            # Normalize & clamp argument to sigmoid to avoid overflow & NaNs
+            arg = (diff / (slope_scale + 1e-6)).clamp(min=-20.0, max=20.0)
+            gate = torch.sigmoid(arg)
+            alpha = float(getattr(self.cfg, 'alpha_modulation', 2.0))
+            if not torch.isfinite(gate):
+                return 1.0
+            scale = 1.0 / (1.0 + alpha * gate.item())
+            return _safe_return(scale)

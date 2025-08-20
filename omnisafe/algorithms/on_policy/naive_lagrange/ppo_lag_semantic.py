@@ -8,6 +8,7 @@ features (reward shaping, risk head) are activated via existing hooks added to
 from __future__ import annotations
 
 from omnisafe.algorithms.on_policy.naive_lagrange.ppo_lag import PPOLag
+from omnisafe.algorithms.on_policy.base.policy_gradient import PolicyGradient
 from omnisafe.algorithms import registry
 
 
@@ -68,3 +69,40 @@ class PPOLagSem(PPOLag):  # pragma: no cover simple wiring
                 self._cfgs,
                 semantic_manager=self._semantic_manager,
             )
+
+    def _update(self) -> None:  # type: ignore[override]
+        """Extend PPOLag update with optional Lagrange modulation using risk predictions.
+
+        If semantic modulation enabled and risk head exists with sufficient samples, scale the
+        effective lambda optimizer step size for this update only by multiplying gradients.
+        """
+        # Standard cost statistic
+        import numpy as np  # local import to avoid top-level changes
+        Jc = self._logger.get_stats('Metrics/EpCost')[0]
+        assert not np.isnan(Jc), 'cost for updating lagrange multiplier is nan'
+        # Determine modulation scale
+        scale = 1.0
+        sem_cfg = getattr(self._cfgs, 'semantic_cfgs', None)
+        if sem_cfg and getattr(sem_cfg, 'modulation_enable', False) and hasattr(self, '_semantic_manager'):
+            try:
+                if hasattr(self, '_risk_head'):
+                    mscale = self._semantic_manager.modulation_scale(self._risk_head)  # type: ignore[attr-defined]
+                    if mscale is not None:
+                        scale = float(mscale)
+            except Exception:  # noqa: BLE001
+                pass
+        # Apply scaled update: temporarily adjust optimizer lr
+        base_lr = self._lagrange.lambda_optimizer.param_groups[0]['lr']  # type: ignore[attr-defined]
+        if scale != 1.0:
+            self._lagrange.lambda_optimizer.param_groups[0]['lr'] = base_lr * scale  # type: ignore[attr-defined]
+        self._lagrange.update_lagrange_multiplier(Jc)  # type: ignore[attr-defined]
+        if scale != 1.0:
+            # restore base lr
+            self._lagrange.lambda_optimizer.param_groups[0]['lr'] = base_lr  # type: ignore[attr-defined]
+        # Proceed with normal actor/critic + risk head update via superclass chain (PolicyGradient)
+        # Invoke base PolicyGradient update (actor/critic + risk head hook) directly
+        PolicyGradient._update(self)  # type: ignore[misc]
+        # Log lambda
+        self._logger.store({'Metrics/LagrangeMultiplier': self._lagrange.lagrangian_multiplier})  # type: ignore[attr-defined]
+        if scale != 1.0:
+            self._logger.store({'Risk/ModulationScale': scale})

@@ -90,12 +90,16 @@ $$
 $$
 Only $\theta$ receives gradients through policy surrogate; $\phi$ through risk head; encoder frozen.
 
-#### 4.0.5 Planned Lagrange Modulation (Scaffold)
-Let empirical distribution of recent predicted truncated costs be $Q$. For chosen upper quantile $q_{\alpha}$, define a modulation scale (example logistic transform):
+#### 4.0.5 Lagrange Modulation (Initial Implementation)
+Let empirical distribution of recent predicted (episode-aware) truncated discounted costs be $Q$. For chosen upper quantile $q_{\alpha}$ and median $q_{med}$ define
 $$
-\eta_t = \sigma\left( \frac{ q_{\alpha}(Q) - q_{med}(Q)}{\tau} \right), \quad \sigma(z)=\frac{1}{1+e^{-z}}.
+z_t = \frac{ q_{\alpha}(Q) - q_{med}(Q)}{\tau},
 $$
-Future work: adjust effective learning rate of $\lambda$ update: $ \lambda \leftarrow \lambda + \eta_t \cdot \Delta \lambda_{base} $. This adaptively accelerates constraint enforcement when tail risk rises.
+with temperature $\tau>0$. A logistic squashing yields
+$$
+\eta_t = \sigma(z_t)=\frac{1}{1+e^{-z_t}}.
+$$
+Implementation: we modulate the effective learning rate of the Lagrange multiplier optimizer each PPO update: $\text{lr}_\lambda^{eff} = \eta_t \cdot \text{lr}_\lambda$. High tail risk (large quantile gap) accelerates λ adaptation; low risk dampens oscillations. Logged as `Risk/ModulationScale`.
 
 #### 4.0.6 Convergence Considerations
 Because shaping vanishes ($\beta_t \to 0$) and auxiliary loss does not alter the final reward signal, fixed points coincide with those of PPO-Lagrange (assuming perfect critics). Auxiliary risk training influences representation quality and early policy gradients but not terminal optimality.
@@ -152,7 +156,7 @@ All semantic flags default to False ensuring drop-in baseline compatibility.
 | Inputs to Policy | Environment observation only | Same (embedding NOT concatenated yet) |
 | Reward Signal | Env reward | Env reward + transient semantic shaping term (annealed) |
 | Auxiliary Loss | None | Risk head Smooth L1 (optional) |
-| Lagrange Update | Standard | (Currently same; modulation scaffold only) |
+| Lagrange Update | Standard | Optional lr scaling via risk quantile modulation |
 | Compute Overhead | Base PPO-Lag | + Periodic CLIP embedding (controlled by `capture_interval`) |
 | Config Surface | Standard YAML | Adds `semantic_cfgs` sub-tree |
 | Stability Risk | Mature baseline | Guarded feature flags; shaping decays to zero |
@@ -165,8 +169,8 @@ All semantic flags default to False ensuring drop-in baseline compatibility.
 5. **Scalable Extension Path**: Future modulation, prompt adaptation, or episodic critique can hook into existing `SemanticManager` without rewriting training loops.
 
 ## 7. Current Limitations
-- Risk target is a sliding approximation (not exact bootstrapped cost-to-go).
-- No Lagrange modulation yet (feature scaffold only).
+- Risk targets are truncated discounted sums (episode-masked) without bootstrap tail; may retain bias near horizon.
+- Lagrange modulation heuristic simple (single quantile gap + logistic) and unsmoothed; temperature sensitivity uncalibrated.
 - Potential domain gap: CLIP general visual pretraining may not perfectly encode environment-specific safety cues (may require prompt tuning or adapter fine-tuning).
 - Additional GPU memory & initial download time for CLIP (≈600MB).
 
@@ -176,7 +180,7 @@ All semantic flags default to False ensuring drop-in baseline compatibility.
 | P0 Parity | Ensure no regression | Run PPOLag vs PPOLagSem (disabled semantics) | Matching curves (± small stochastic noise) |
 | P1 Activation | Validate shaping & risk | Enable shaping & risk separately | No crashes; shaping decays; risk loss declines |
 | P2 Metrics | Diagnostic depth | Log raw vs shaped reward, risk correlation | Risk pred corr > 0.3 early |
-| P3 Modulation | Adaptive constraint tuning | Implement LR scaling of Lagrange via risk quantiles | Reduced overshoot/variance of cost |
+| P3 Modulation | Adaptive constraint tuning | Implement LR scaling of Lagrange via risk quantiles | (DONE) Reduced overshoot/variance of cost |
 | P4 Target Refinement | Improve risk accuracy | Replace sliding horizon with reverse discounted cumulative computation | Lower risk head loss variance |
 | P5 Prompt Study | Optimize semantics | Sweep prompt sets / sizes | Best set improves time-to-threshold >15% |
 | P6 Efficiency | Reduce overhead | Batch embeddings, optional async | <10% FPS drop vs baseline |
@@ -294,7 +298,9 @@ This section enumerates the concrete code-level changes, device/dtype design, an
 |15 | Embedding storage optimization | `semantic_manager.py` | Avoid unnecessary `.cpu()` when host is GPU | Minimizes transfers for large windows |
 |16 | Centroid precision policy | `semantic_manager.py` | Keep reduced precision on GPU, cast only on CPU | Saves memory/bandwidth when GPU host |
 |17 | Added robust error fallback labeling | `semantic_manager.py` | Distinguish safetensors absence vs other errors | Easier debugging & reproducibility |
-|18 | Updated thesis with formal math & deep dive | `thesis.md` | Documentation completeness | Current version bump |
+|18 | Updated thesis with formal math & deep dive | `thesis.md` | Documentation completeness | Version bump |
+|19 | Episode-aware risk target masking | `semantic_manager.py`, `policy_gradient.py` | Avoid cross-episode leakage in targets | Flag `risk_episode_mask_enable` |
+|20 | Lagrange modulation (lr scaling) | `ppo_lag_semantic.py` | Adaptive constraint responsiveness | Log key `Risk/ModulationScale` |
 
 ### 15.2 Device & Data Flow Specification
 ```
@@ -354,6 +360,7 @@ Risk Head Training Loop:
 | `Risk/PredMean` | Scalar | Risk head output | Mean predicted discounted cost |
 | `Risk/TargetMean` | Scalar | Computed targets | Mean target truncated discounted cost |
 | `Risk/Corr` | Scalar (optional) | Correlation computation | Pearson correlation prediction vs target |
+| `Risk/ModulationScale` | Scalar | Modulation routine | Scale applied to Lagrange optimizer lr |
 
 ### 15.6 Performance Considerations
 | Aspect | Action | Effect |
@@ -383,7 +390,7 @@ Risk Head Training Loop:
 4. Early enforcement of safetensors avoided silent fallback to slower legacy formats and tightened supply chain integrity.
 
 ---
-*Document Version: v1.4 (adds executive technical summary, baseline vs semantic pseudocode, explicit parity guarantee, clarified risk head update timing).* 
+*Document Version: v1.9 (includes episode-aware risk masking & initial Lagrange modulation; supersedes earlier addenda v1.4–v1.8).* 
 
 ---
 ## 26. v1.5 Addendum: Spatial Batching Implementation
@@ -603,6 +610,23 @@ python examples/train_policy.py --algo PPOLagSem --env-id SafetyCarGoal1-v0 --se
 | v1.5 | 2025-08-19 | Spatial batching (per-env embeddings & shaping), batch OOM backoff, capture count telemetry |
 | v1.6 | 2025-08-19 | Telemetry expansion (RawMargin/NormMargin/Beta/ClampFrac/CaptureIntervalEffective), config additions (risk_lr, margin_norm_enable, margin_scale), removal of obsolete ClipReady/ClipStatus, CSV semantic analysis script |
 | v1.7 | 2025-08-19 | Potential-based shaping implementation (`potential_enable`), shaping influence metrics (ShapingRewardRatio, ShapingStd), documentation of additive vs potential formulation, neutrality rationale |
+| v1.8 | 2025-08-19 | Risk head backward (reverse) discounted target rollout implemented; clarified target construction; offline semantic probe & prompt engineering workflow documented; roadmap/status updated (risk target refinement DONE) |
+| v1.9 | 2025-08-20 | Episode-aware risk target masking; initial Lagrange modulation (lr scaling); log key `Risk/ModulationScale`; config flag `risk_episode_mask_enable` |
+
+### 24.1 Active Feature Matrix
+| Feature | Status | Config Flag(s) | Notes |
+|---------|--------|---------------|-------|
+| Reward shaping (additive) | Stable | `shaping_enable`, `margin_norm_enable`, `margin_scale` | Annealed beta schedule |
+| Reward shaping (potential-based) | Stable | `potential_enable` | Potential difference, neutrality |
+| Spatial batching | Stable | `batch_across_envs`, `batch_max`, `oom_backoff` | Per-env shaping vector |
+| Risk head auxiliary loss | Stable | `risk_enable`, `risk_horizon`, `discount`, `risk_lr` | Single batch update post PPO |
+| Backward risk target rollout | Stable | (implicit) | Reverse pass + forward clamp |
+| Episode-aware masking | Stable | `risk_episode_mask_enable` | Prevents cross-episode leakage |
+| Lagrange modulation (lr scaling) | Experimental | `modulation_enable`, `threshold_percentile`, `alpha_modulation`, `slope` | Logistic quantile gap (no smoothing) |
+| Offline semantic probe | Stable | (script) | Prompt separability diagnostics |
+| Target bootstrap tail | Planned | — | Potential bias reduction |
+| Modulation smoothing (EMA) | Planned | — | Reduce scale volatility |
+| Embedding fusion into policy | Deferred | — | Requires net architecture changes |
 
 ---
 ## 25. Executive Technical Summary (Consolidated)
@@ -678,10 +702,10 @@ backprop(loss)
 ```
 
 ### 25.11 Known Limitations
-- Single global frame per capture (no per-env spatial batching).
-- Subsampled risk buffer (one embedding per capture interval regardless of env count).
-- No λ modulation, no late fusion of embeddings into policy network.
-- Risk target = truncated forward sum only (no reverse cumulative or bootstrap).
+- Spatial batching implemented but current description above still outlines single-frame path for historical reference; ensure active config (`batch_across_envs`) is documented per experiment.
+- Risk buffer per-capture sampling may still under-represent tail events if `capture_interval` large.
+- λ modulation heuristic minimal (no smoothing); embeddings not fused into policy network.
+- Risk target = truncated discounted sum (episode-masked) without bootstrap tail.
 - Lacking semantic-specific unit tests (planned).
 
 ### 25.12 Performance Considerations
@@ -706,6 +730,86 @@ backprop(loss)
 
 ### 25.16 Parity Guarantee Statement
 Formally: With `semantic_cfgs.enable=False`, code executes identical operations (order, tensors, gradients) as baseline PPO-Lagrange except for negligible conditional checks (branch predicate false). No additional modules, parameters, or memory allocations are instantiated.  Verified via: identical logged keys set, absence of semantic directories, and matching cumulative reward curves within stochastic variance.
+
+---
+
+## 29. Backward Risk Target Rollout Implementation (v1.8)
+
+### 29.1 Motivation
+Earlier versions approximated truncated discounted cost targets via forward windowed sums. We replaced this with a reverse (backward) discounted accumulation pass producing cost-to-go style targets more stable numerically and less sensitive to horizon edge effects. This improves temporal credit alignment for the auxiliary risk predictor without introducing policy gradient leakage.
+
+### 29.2 Algorithm
+Given recent instantaneous costs sequence `c[0:L]` (aligned with collected embeddings `e[0:L]`) and discount `γ_c` plus horizon `H`:
+1. Reverse iterate i = L-1 → 0 accumulating `running = c[i] + γ_c * running` (standard backward return) storing preliminary target `t[i] = running` until `H` steps back reached.
+2. For indices where full horizon not covered (i close to sequence start) optionally recompute a forward truncated sum to strictly enforce horizon cap, matching implementation detail in `policy_gradient.py`.
+3. If `H < L`, forward refinement loop ensures each `t[i]` only includes up to `H` discounted terms, preventing overestimation in very long buffers.
+
+### 29.3 Implementation Notes
+* Executed inside `_update()` after PPO actor/critic updates (keeps auxiliary gradient step segregated).
+* Operates on most recent window (`L` limited implicitly by deque length and embedding availability).
+* Embeddings and costs are truncated to same trailing length `L` prior to target construction.
+* Smooth L1 loss still applied; dtype alignment (embedding cast to risk head param dtype) retained.
+* Correlation logging unaffected; typically exhibits higher early correlation due to reduced target variance.
+
+### 29.4 Benefits
+| Aspect | Forward Truncated | Backward Rollout (Current) |
+|--------|-------------------|----------------------------|
+| Numerical Stability | Medium (repeated slice sums) | High (single pass + optional refinement) |
+| Horizon Enforcement | Explicit loops | Backward base + forward clamp |
+| Correlation Onset | Slower (noisy tail) | Faster (smoother targets) |
+| Compute Cost | O(L*H) worst | O(L + min(L,H)) |
+
+### 29.5 Future Refinements
+* Episode boundary masking (avoid leakage across terminal states when windows straddle episodes).
+* Optional generalized advantage style exponential weighting variants.
+* Target normalization (z-score or min-max) to stabilize loss scale across environments.
+
+## 30. Offline Semantic Probe & Prompt Engineering Workflow
+
+### 30.1 Purpose
+An external diagnostic script (`examples/offline_clip_semantic_probe.py`) accelerates prompt iteration by quantifying centroid separability and annotating videos with per-frame safe/unsafe similarities and margin overlays without re-running full RL training.
+
+### 30.2 Current Capabilities
+* Loads video frames, batches them through CLIP (cpu or gpu).
+* Computes and stores safe & unsafe centroid embeddings, cosine similarity distributions, centroid cosine / angle / euclidean separation metrics.
+* Produces annotated output video (frame text overlay: safe_sim, unsafe_sim, margin).
+* Exports `centroids_and_stats.json` with discriminability metrics (intra vs cross similarities, centroid margin).
+
+### 30.3 Simplification Iterations
+1. Initial: CLI args, CSV exports, normalization toggles, potential shaping preview.
+2. Simplified: Kept only annotated video + centroid stats JSON (removed CSV & YAML loading path for faster iteration).
+3. Added centroid discriminability statistics (pairwise intra-class, inter-class similarity, angle, euclidean distance).
+4. Prompt expansion (broad domain descriptors) → observed reduced separation.
+5. Prompt pruning using stronger visual anchor (“red warning circle”) producing improved qualitative discriminability.
+
+### 30.4 Planned Enhancements
+* Temporal smoothing (EMA or sliding window mean embedding) to reduce per-frame jitter.
+* Per-prompt scoring: contribution to centroid margin & variance; automated pruning.
+* Batch evaluation harness for multiple prompt lists (grid search) with summarized discriminability score.
+
+### 30.5 Rationale for External Probe
+Keeps RL training loop lean; enables rapid semantic hypothesis testing (prompt wording, visual anchor selection) offline, de-risking integration changes.
+
+## 31. Roadmap Status Update (Post v1.8)
+
+| Roadmap Item | Previous Status | Current Status | Notes |
+|--------------|-----------------|----------------|-------|
+| Reverse discounted risk target | Planned | DONE | Backward rollout implemented (v1.8) |
+| Potential-based shaping | DONE | DONE | Stable; neutrality metrics in place |
+| Spatial batching | DONE | DONE | Baseline path retained for ablation |
+| Lambda modulation | Pending | Pending | Await robust risk correlation + quantile design |
+| Temporal smoothing (probe) | Not started | Pending | To implement in offline script first |
+| Prompt scoring & pruning | Not started | Pending | Will integrate into probe before training auto-adapt |
+| Unit tests (semantic) | Partial | Partial | Still need margin sign swap, beta schedule, risk correlation synthetic |
+| Config snapshot export | Pending | Pending | Include transformers version & prompt hashes |
+| Async embedding | Deferred | Deferred | Only if profiling identifies bottleneck post batching |
+
+## 32. Updated Immediate Action Recommendations
+1. Add episode-aware masking to risk target builder (avoid cross-episode accumulation in long buffers).
+2. Implement temporal smoothing in offline probe; reassess centroid cosine and per-frame variance.
+3. Introduce per-prompt scalar influence score (delta to centroid separation when removed) and prune low-impact prompts.
+4. Prepare unit tests for semantic margin normalization and risk target correctness.
+5. Prototype λ modulation using empirical risk prediction quantiles (simulate scaling factor offline with logged trajectories before live integration).
 
 ---
 

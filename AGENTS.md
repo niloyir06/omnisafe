@@ -8,7 +8,7 @@ Variant: `PPOLagSem` (activates when `semantic_cfgs.enable=True`).
 Core Components:
 * `SemanticManager`: CLIP load, prompt centroids, shaping, risk buffers, spatial batch embedding.
 * `SemanticOnPolicyAdapter`: Frame capture, embedding (batched or single), shaping injection, semantic logging.
-* (Scaffold) Risk head MLP for future auxiliary prediction & modulation.
+* Risk head MLP for auxiliary future cost prediction & (initial) Lagrange modulation.
 Flow: env render(s) → CLIP embedding(s) → safe vs unsafe centroid cosine margin → annealed beta(t) → shaping reward addition.
 
 Shaping Modes:
@@ -57,24 +57,26 @@ Semantic core:
 * `Semantics/CaptureCount` – number of capture events
 * `Semantics/CaptureIntervalEffective` – steps since last capture
 
-Risk (active): `Risk/Loss`, `Risk/PredMean`, `Risk/TargetMean`, `Risk/Corr`.
+Risk (active): `Risk/Loss`, `Risk/PredMean`, `Risk/TargetMean`, `Risk/Corr`, `Risk/ModulationScale`.
 
 Removed legacy: `Semantics/Debug/ClipReady`, `Semantics/Debug/ClipStatus`.
 
 ## 6. Limitations
 1. No temporal batching (spatial only; temporal pending justification).
-2. Risk targets are truncated forward sums (episode-aware reverse cumulative pending).
+2. Risk targets use backward discounted rollout with episode-aware masking (prevents cross-episode leakage) but no bootstrap tail.
 3. Per-capture shaping std not logged (only epoch aggregation for shaping mean/min/max).
 4. Some vector envs may yield a single composite frame (replication heuristic used).
 5. Missing unit tests: margin normalization toggle, beta schedule edges, risk correlation synthetic.
+6. Risk predictions used to modulate Lagrange update learning rate (heuristic logistic quantile gap scaling; no smoothing yet).
 
 ## 7. Planned Enhancements (Priority)
-1. Improved risk targets (episode-aware reverse discounted) & normalization option.
-2. Lagrange modulation via risk quantile gating.
+1. Bootstrap tail for risk targets (optional value function mix) & target normalization.
+2. Smoothing / ablation for Lagrange modulation (EMA, alternative metrics).
 3. Shaping distribution (per-capture std) & batch size logging.
 4. Unit tests: beta schedule, margin scaling toggle, risk correlation synthetic, batching parity.
-5. Prompt adaptation / dynamic refresh.
+5. Prompt adaptation / dynamic refresh (guided by offline probe scoring).
 6. Temporal/async embedding (only if profiling bottleneck).
+7. Offline probe temporal smoothing & automated prompt pruning.
 
 ## 8. Troubleshooting
 | Issue | Diagnostic | Resolution |
@@ -100,6 +102,8 @@ Removed legacy: `Semantics/Debug/ClipReady`, `Semantics/Debug/ClipStatus`.
 | margin_scale | Multiplicative scale on raw margin | 1.0 |
 | potential_enable | Use potential-based shaping instead of additive | False |
 | risk_lr | Risk head learning rate | 1e-3 |
+| risk_episode_mask_enable | Episode-aware masking for risk targets | True |
+| modulation_enable | Enable Lagrange lr modulation | False |
 | risk_horizon | Discount horizon for risk target | 64 |
 | discount | Risk target discount | 0.99 |
 | window_size | Risk buffer size | 2048 |
@@ -119,15 +123,16 @@ Removed legacy: `Semantics/Debug/ClipReady`, `Semantics/Debug/ClipStatus`.
 * Risk head depth & regularization tuning postponed until baseline predictive utility observed.
 
 ## 12. Immediate TODOs
-- [ ] Improved risk targets (episode-aware reverse discounted).
+- [ ] Episode boundary masking for backward risk targets.
 - [ ] Lagrange modulation quantile experiment.
 - [ ] Shaping per-capture std & batch size metric.
 - [ ] Unit tests (beta schedule, margin scaling, risk correlation synthetic).
 - [ ] Synthetic frame fallback helper.
+- [ ] Offline probe temporal smoothing + prompt pruning scoring.
 
 ## 13. Version Stamp
-* Thesis Document: v1.7 (potential shaping + shaping ratio/std)
-* Agent Summary: v1.4 (adds potential-based shaping + shaping influence metrics)
+* Thesis Document: v1.9 (episode-aware risk masking + lr modulation)
+* Agent Summary: v1.6 (modulation + masking reflected)
 
 ---
 For continuity—update incrementally with each semantic feature change (do not delete).

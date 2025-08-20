@@ -96,7 +96,12 @@ class SemanticOnPolicyAdapter(OnPolicyAdapter):  # pragma: no cover minimal logi
                         logger.store(self._semantic_manager.debug_metrics())
                         # record risk data (use per-env mean cost element-wise) cost is vector length num_envs
                         mean_costs = cost.detach().cpu().tolist()
-                        self._semantic_manager.record_multi_step(embeddings, mean_costs)
+                        # derive per-env done flags (terminated OR truncated)
+                        try:
+                            dones_list = (terminated | truncated).detach().cpu().tolist()
+                        except Exception:  # noqa: BLE001
+                            dones_list = [False] * len(mean_costs)
+                        self._semantic_manager.record_multi_step(embeddings, mean_costs, dones_list)
                     except Exception:  # noqa: BLE001
                         self._semantic_manager.advance_step()
                 else:
@@ -129,7 +134,12 @@ class SemanticOnPolicyAdapter(OnPolicyAdapter):  # pragma: no cover minimal logi
                         except Exception:
                             pass
                         logger.store({'Semantics/ShapingStd': torch.as_tensor(0.0)})
-                    self._semantic_manager.record_step(embedding, float(cost.mean().item()))
+                    # Single-path done if ANY env done this step (approx) for legacy; choose mean done
+                    try:
+                        done_flag = bool(bool(terminated.any()) or bool(truncated.any()))
+                    except Exception:  # noqa: BLE001
+                        done_flag = False
+                    self._semantic_manager.record_step(embedding, float(cost.mean().item()), done_flag)
                     latency = self._semantic_manager.last_embed_latency_ms if embedding is not None else 0.0
                     logger.store({'Semantics/EmbedLatencyMs': latency})
                     logger.store({'Semantics/Shaping': torch.as_tensor(shaping)})

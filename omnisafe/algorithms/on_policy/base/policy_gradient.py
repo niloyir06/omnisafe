@@ -234,6 +234,7 @@ class PolicyGradient(BaseAlgo):
         self._logger.register_key('Risk/TargetMean')
         self._logger.register_key('Risk/Corr')
         self._logger.register_key('Risk/LR')
+        self._logger.register_key('Risk/ModulationScale')
 
         # Semantic telemetry (raw margin diagnostics & schedule)
         win = wl
@@ -445,32 +446,27 @@ class PolicyGradient(BaseAlgo):
                     rh_dtype = next(self._risk_head.parameters()).dtype
                     if embs.dtype != rh_dtype:
                         embs = embs.to(dtype=rh_dtype)
-                    costs = torch.tensor(list(self._semantic_manager.costs), dtype=torch.float32, device=risk_device)  # type: ignore[attr-defined]
-                    L = min(len(costs), embs.shape[0])
-                    embs = embs[-L:]
-                    costs = costs[-L:]
                     horizon = getattr(sem_cfg, 'risk_horizon', 64)
                     gamma = getattr(sem_cfg, 'discount', 0.99)
-                    # Reverse discounted cumulative (episode-unaware here; window-limited) for better target consistency.
                     with torch.no_grad():
-                        # Take last L costs slice to align with embs already truncated. Compute reverse discounted cumulative up to horizon.
-                        slice_costs = costs[-L:]
-                        targets = torch.zeros_like(slice_costs)
-                        running = torch.zeros(1, device=costs.device)
-                        steps = 0
-                        # Iterate backwards to produce potential-like cost-to-go approximation.
-                        for idx in range(L - 1, -1, -1):
-                            running = slice_costs[idx] + gamma * running
-                            targets[idx] = running
-                            steps += 1
-                            if steps >= horizon:
-                                running = running - (gamma ** (horizon - 1)) * slice_costs[min(idx + horizon - 1, L - 1)]  # safety bound; horizon clamp
-                        # Clip to horizon by recomputing forward-limited discounted sums (more precise) if horizon < L
-                        if horizon < L:
-                            disc_vec = torch.tensor([gamma ** k for k in range(horizon)], device=costs.device)
-                            for j in range(L):
-                                rng = slice_costs[j:j + horizon]
-                                targets[j] = (rng * disc_vec[: rng.shape[0]]).sum()
+                        if getattr(sem_cfg, 'risk_episode_mask_enable', True):
+                            targets_full = self._semantic_manager.build_episode_masked_targets(gamma=gamma, horizon=horizon)  # type: ignore[attr-defined]
+                            if targets_full is None:
+                                return
+                            L = min(len(targets_full), embs.shape[0])
+                            targets = targets_full[-L:].to(risk_device)
+                            embs = embs[-L:]
+                        else:
+                            # Fallback: simple truncated forward sums without episode reset
+                            costs = torch.tensor(list(self._semantic_manager.costs), dtype=torch.float32, device=risk_device)  # type: ignore[attr-defined]
+                            L = min(len(costs), embs.shape[0])
+                            costs = costs[-L:]
+                            embs = embs[-L:]
+                            disc = torch.tensor([gamma ** k for k in range(horizon)], device=risk_device)
+                            targets = torch.zeros(L, dtype=torch.float32, device=risk_device)
+                            for i in range(L):
+                                seg = costs[i:i + horizon]
+                                targets[i] = (seg * disc[: seg.shape[0]]).sum()
                     preds = self._risk_head(embs)
                     loss = torch.nn.functional.smooth_l1_loss(preds.float(), targets.float())
                     self._risk_opt.zero_grad()
@@ -491,6 +487,14 @@ class PolicyGradient(BaseAlgo):
                         'Risk/PredMean': preds.mean().item(),
                         'Risk/TargetMean': targets.mean().item(),
                     }
+                    # Optional modulation scale logging (no application here; algorithm variant can consume)
+                    try:
+                        if getattr(sem_cfg, 'modulation_enable', False):
+                            scale = self._semantic_manager.modulation_scale(self._risk_head)  # type: ignore[attr-defined]
+                            if scale is not None:
+                                log_dict['Risk/ModulationScale'] = scale
+                    except Exception:  # noqa: BLE001
+                        pass
                     # Optionally log lr used
                     if hasattr(self, '_risk_opt'):
                         for pg in self._risk_opt.param_groups:
