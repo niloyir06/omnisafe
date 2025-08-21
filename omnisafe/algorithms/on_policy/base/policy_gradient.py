@@ -235,6 +235,13 @@ class PolicyGradient(BaseAlgo):
         self._logger.register_key('Risk/Corr')
         self._logger.register_key('Risk/LR')
         self._logger.register_key('Risk/ModulationScale')
+        # Additional modulation gating telemetry (episode-count gate & active flag)
+        self._logger.register_key('Risk/ModulationEpisodes')
+        self._logger.register_key('Risk/ModulationActive')
+        # Risk buffer diagnostics (semantic extension)
+        self._logger.register_key('Risk/Buf/Embeddings')
+        self._logger.register_key('Risk/Buf/Costs')
+        self._logger.register_key('Risk/Buf/Dones')
 
         # Semantic telemetry (raw margin diagnostics & schedule)
         win = wl
@@ -448,32 +455,39 @@ class PolicyGradient(BaseAlgo):
                         embs = embs.to(dtype=rh_dtype)
                     horizon = getattr(sem_cfg, 'risk_horizon', 64)
                     gamma = getattr(sem_cfg, 'discount', 0.99)
+                    targets = None
                     with torch.no_grad():
                         if getattr(sem_cfg, 'risk_episode_mask_enable', True):
                             targets_full = self._semantic_manager.build_episode_masked_targets(gamma=gamma, horizon=horizon)  # type: ignore[attr-defined]
-                            if targets_full is None:
-                                return
-                            L = min(len(targets_full), embs.shape[0])
-                            targets = targets_full[-L:].to(risk_device)
-                            embs = embs[-L:]
+                            if targets_full is not None:
+                                L = min(len(targets_full), embs.shape[0])
+                                targets = targets_full[-L:].to(risk_device)
+                                embs = embs[-L:]
                         else:
                             # Fallback: simple truncated forward sums without episode reset
                             costs = torch.tensor(list(self._semantic_manager.costs), dtype=torch.float32, device=risk_device)  # type: ignore[attr-defined]
-                            L = min(len(costs), embs.shape[0])
-                            costs = costs[-L:]
-                            embs = embs[-L:]
-                            disc = torch.tensor([gamma ** k for k in range(horizon)], device=risk_device)
-                            targets = torch.zeros(L, dtype=torch.float32, device=risk_device)
-                            for i in range(L):
-                                seg = costs[i:i + horizon]
-                                targets[i] = (seg * disc[: seg.shape[0]]).sum()
-                    preds = self._risk_head(embs)
-                    loss = torch.nn.functional.smooth_l1_loss(preds.float(), targets.float())
-                    self._risk_opt.zero_grad()
-                    loss.backward()
-                    self._risk_opt.step()
+                            if costs.numel() > 0:
+                                L = min(len(costs), embs.shape[0])
+                                costs = costs[-L:]
+                                embs = embs[-L:]
+                                disc = torch.tensor([gamma ** k for k in range(horizon)], device=risk_device)
+                                targets = torch.zeros(L, dtype=torch.float32, device=risk_device)
+                                for i in range(L):
+                                    seg = costs[i:i + horizon]
+                                    targets[i] = (seg * disc[: seg.shape[0]]).sum()
+                    preds = None
+                    loss_val = 0.0
+                    target_mean = 0.0
+                    if targets is not None:
+                        preds = self._risk_head(embs)
+                        loss_t = torch.nn.functional.smooth_l1_loss(preds.float(), targets.float())
+                        self._risk_opt.zero_grad()
+                        loss_t.backward()
+                        self._risk_opt.step()
+                        loss_val = loss_t.item()
+                        target_mean = targets.mean().item()
                     corr_val = None
-                    if preds.numel() > 10:
+                    if preds is not None and preds.numel() > 10 and targets is not None:
                         p = preds.detach().flatten()
                         t = targets.detach().flatten()
                         if p.std() > 1e-6 and t.std() > 1e-6:
@@ -483,9 +497,9 @@ class PolicyGradient(BaseAlgo):
                             except Exception:  # pragma: no cover
                                 corr_val = None
                     log_dict = {
-                        'Risk/Loss': loss.item(),
-                        'Risk/PredMean': preds.mean().item(),
-                        'Risk/TargetMean': targets.mean().item(),
+                        'Risk/Loss': loss_val,
+                        'Risk/PredMean': 0.0 if preds is None else preds.mean().item(),
+                        'Risk/TargetMean': target_mean,
                     }
                     # Optional modulation scale logging (no application here; algorithm variant can consume)
                     try:
