@@ -236,12 +236,15 @@ class PolicyGradient(BaseAlgo):
         self._logger.register_key('Risk/LR')
         self._logger.register_key('Risk/ModulationScale')
         # Additional modulation gating telemetry (episode-count gate & active flag)
-        self._logger.register_key('Risk/ModulationEpisodes')
         self._logger.register_key('Risk/ModulationActive')
         # Risk buffer diagnostics (semantic extension)
         self._logger.register_key('Risk/Buf/Embeddings')
         self._logger.register_key('Risk/Buf/Costs')
         self._logger.register_key('Risk/Buf/Dones')
+        # Risk training status diagnostics (added after initial set; keep short window)
+        self._logger.register_key('Risk/TrainStatusCode', window_length=100)
+        self._logger.register_key('Risk/TrainStatusMsgLen', window_length=100)
+        self._logger.register_key('Risk/TrainSamples')
 
         # Semantic telemetry (raw margin diagnostics & schedule)
         win = wl
@@ -429,6 +432,7 @@ class PolicyGradient(BaseAlgo):
         # Semantic risk head update hook (only if semantic manager attached by subclass/override)
         if hasattr(self, '_semantic_manager') and hasattr(self._cfgs, 'semantic_cfgs') and getattr(self, '_semantic_manager') is not None:  # type: ignore[attr-defined]
             sem_cfg = self._cfgs.semantic_cfgs  # type: ignore[attr-defined]
+            # removed verbose entry debug
             if getattr(sem_cfg, 'risk_enable', False):
                 if not hasattr(self, '_risk_head'):
                     from omnisafe.common.semantics.risk_head import SemanticRiskHead
@@ -442,84 +446,126 @@ class PolicyGradient(BaseAlgo):
                             self._risk_head = self._risk_head.to(dtype=clip_dtype)
                     except Exception:  # noqa: BLE001
                         pass
-                    # Use configured learning rate if provided (fall back to 1e-3)
                     risk_lr = getattr(sem_cfg, 'risk_lr', 1e-3)
                     self._risk_opt = torch.optim.Adam(self._risk_head.parameters(), lr=risk_lr)
                 batch_embs = self._semantic_manager.get_recent_risk_batch()  # type: ignore[attr-defined]
-                if batch_embs is not None and batch_embs.shape[0] > 8:
+                train_status_code = None  # 0=trained, 1=no_embeddings, 2=too_few_embeddings, 3=targets_none
+                train_status_msg = ''
+                samples_used = 0
+                min_samples = int(getattr(sem_cfg, 'risk_min_samples', 5))
+                if batch_embs is not None and batch_embs.shape[0] >= min_samples:
                     risk_device = next(self._risk_head.parameters()).device
-                    embs = batch_embs.to(risk_device)
-                    # Ensure dtype matches risk head (avoid Float vs BFloat16 mismatch)
                     rh_dtype = next(self._risk_head.parameters()).dtype
-                    if embs.dtype != rh_dtype:
-                        embs = embs.to(dtype=rh_dtype)
+                    full_embs = batch_embs.to(risk_device)
+                    if full_embs.dtype != rh_dtype:
+                        full_embs = full_embs.to(dtype=rh_dtype)
                     horizon = getattr(sem_cfg, 'risk_horizon', 64)
                     gamma = getattr(sem_cfg, 'discount', 0.99)
-                    targets = None
-                    with torch.no_grad():
-                        if getattr(sem_cfg, 'risk_episode_mask_enable', True):
-                            targets_full = self._semantic_manager.build_episode_masked_targets(gamma=gamma, horizon=horizon)  # type: ignore[attr-defined]
-                            if targets_full is not None:
-                                L = min(len(targets_full), embs.shape[0])
-                                targets = targets_full[-L:].to(risk_device)
-                                embs = embs[-L:]
+                    episode_mask_enable = getattr(sem_cfg, 'risk_episode_mask_enable', True)
+                    update_iters = max(1, int(getattr(sem_cfg, 'risk_update_iters', 1)))
+                    batch_size = int(getattr(sem_cfg, 'risk_batch_size', 0))
+                    total_loss = 0.0
+                    last_preds = None
+                    last_targets_mean = 0.0
+                    corr_val = None
+                    for it in range(update_iters):
+                        if batch_size > 0:
+                            # Random sample without replacement if possible, else with replacement
+                            if full_embs.shape[0] <= batch_size:
+                                embs = full_embs
+                            else:
+                                idx = torch.randperm(full_embs.shape[0], device=full_embs.device)[:batch_size]
+                                embs = full_embs[idx]
                         else:
-                            # Fallback: simple truncated forward sums without episode reset
-                            costs = torch.tensor(list(self._semantic_manager.costs), dtype=torch.float32, device=risk_device)  # type: ignore[attr-defined]
-                            if costs.numel() > 0:
-                                L = min(len(costs), embs.shape[0])
-                                costs = costs[-L:]
-                                embs = embs[-L:]
-                                disc = torch.tensor([gamma ** k for k in range(horizon)], device=risk_device)
-                                targets = torch.zeros(L, dtype=torch.float32, device=risk_device)
-                                for i in range(L):
-                                    seg = costs[i:i + horizon]
-                                    targets[i] = (seg * disc[: seg.shape[0]]).sum()
-                    preds = None
-                    loss_val = 0.0
-                    target_mean = 0.0
-                    if targets is not None:
+                            embs = full_embs
+                        # Build targets
+                        with torch.no_grad():
+                            if episode_mask_enable:
+                                targets_full = self._semantic_manager.build_episode_masked_targets(gamma=gamma, horizon=horizon)  # type: ignore[attr-defined]
+                                if targets_full is not None:
+                                    L = min(len(targets_full), embs.shape[0])
+                                    targets = targets_full[-L:].to(risk_device)
+                                    embs = embs[-L:]
+                                else:
+                                    targets = None
+                            else:
+                                costs = torch.tensor(list(self._semantic_manager.costs), dtype=torch.float32, device=risk_device)  # type: ignore[attr-defined]
+                                if costs.numel() > 0:
+                                    L = min(len(costs), embs.shape[0])
+                                    costs = costs[-L:]
+                                    embs = embs[-L:]
+                                    disc = torch.tensor([gamma ** k for k in range(horizon)], device=risk_device)
+                                    targets = torch.zeros(L, dtype=torch.float32, device=risk_device)
+                                    for i in range(L):
+                                        seg = costs[i:i + horizon]
+                                        targets[i] = (seg * disc[: seg.shape[0]]).sum()
+                                else:
+                                    targets = None
+                        if targets is None:
+                            train_status_code = 3
+                            train_status_msg = 'targets_none'
+                            break
                         preds = self._risk_head(embs)
                         loss_t = torch.nn.functional.smooth_l1_loss(preds.float(), targets.float())
                         self._risk_opt.zero_grad()
                         loss_t.backward()
                         self._risk_opt.step()
-                        loss_val = loss_t.item()
-                        target_mean = targets.mean().item()
-                    corr_val = None
-                    if preds is not None and preds.numel() > 10 and targets is not None:
-                        p = preds.detach().flatten()
-                        t = targets.detach().flatten()
-                        if p.std() > 1e-6 and t.std() > 1e-6:
+                        total_loss += loss_t.item()
+                        last_preds = preds.detach()
+                        last_targets_mean = targets.mean().item()
+                        samples_used += embs.shape[0]
+                        # Correlation (use last iteration batch)
+                        if preds.numel() > 10 and targets.numel() > 10 and preds.std() > 1e-6 and targets.std() > 1e-6:
                             try:
-                                corr_mat = torch.corrcoef(torch.stack([p, t]))
+                                corr_mat = torch.corrcoef(torch.stack([preds.flatten().detach(), targets.flatten().detach()]))
                                 corr_val = corr_mat[0, 1].item()
                             except Exception:  # pragma: no cover
-                                corr_val = None
-                    log_dict = {
-                        'Risk/Loss': loss_val,
-                        'Risk/PredMean': 0.0 if preds is None else preds.mean().item(),
-                        'Risk/TargetMean': target_mean,
-                    }
-                    # Optional modulation scale logging (no application here; algorithm variant can consume)
-                    try:
-                        if getattr(sem_cfg, 'modulation_enable', False):
-                            scale = self._semantic_manager.modulation_scale(self._risk_head)  # type: ignore[attr-defined]
-                            if scale is not None:
-                                log_dict['Risk/ModulationScale'] = scale
-                    except Exception:  # noqa: BLE001
-                        pass
-                    # Optionally log lr used
-                    if hasattr(self, '_risk_opt'):
-                        for pg in self._risk_opt.param_groups:
-                            if 'lr' in pg:
-                                log_dict['Risk/LR'] = pg['lr']
-                                break
-                    if corr_val is not None:
-                        log_dict['Risk/Corr'] = corr_val
-                    self._logger.store(log_dict)
+                                pass
+                    if train_status_code != 3:
+                        avg_loss = total_loss / update_iters
+                        train_status_code = 0
+                        train_status_msg = 'trained'
+                        log_dict = {
+                            'Risk/Loss': avg_loss,
+                            'Risk/PredMean': 0.0 if last_preds is None else last_preds.mean().item(),
+                            'Risk/TargetMean': last_targets_mean,
+                            'Risk/TrainSamples': float(samples_used),
+                        }
+                        try:
+                            if getattr(sem_cfg, 'modulation_enable', False):
+                                scale = self._semantic_manager.modulation_scale(self._risk_head)  # type: ignore[attr-defined]
+                                if scale is not None:
+                                    log_dict['Risk/ModulationScale'] = scale
+                        except Exception:  # noqa: BLE001
+                            pass
+                        if hasattr(self, '_risk_opt'):
+                            for pg in self._risk_opt.param_groups:
+                                if 'lr' in pg:
+                                    log_dict['Risk/LR'] = pg['lr']
+                                    break
+                        if corr_val is not None:
+                            log_dict['Risk/Corr'] = corr_val
+                        log_dict['Risk/TrainStatusCode'] = float(train_status_code)
+                        log_dict['Risk/TrainStatusMsgLen'] = float(len(train_status_msg))
+                        self._logger.store(log_dict)
                 else:
-                    self._logger.store({'Risk/Loss': 0.0, 'Risk/PredMean': 0.0, 'Risk/TargetMean': 0.0})
+                    if batch_embs is None:
+                        train_status_code = 1
+                        train_status_msg = 'no_embeddings'
+                        emb_count = 0
+                    else:
+                        emb_count = batch_embs.shape[0]
+                        train_status_code = 2
+                        train_status_msg = f'too_few_embeddings:{emb_count}'
+                    self._logger.store({
+                        'Risk/Loss': 0.0,
+                        'Risk/PredMean': 0.0,
+                        'Risk/TargetMean': 0.0,
+                        'Risk/TrainStatusCode': float(train_status_code),
+                        'Risk/TrainStatusMsgLen': float(len(train_status_msg)),
+                        'Risk/Buf/Embeddings': float(0 if batch_embs is None else batch_embs.shape[0]),
+                        'Risk/TrainSamples': float(0),
+                    })
 
     def _update_reward_critic(self, obs: torch.Tensor, target_value_r: torch.Tensor) -> None:
         r"""Update value network under a double for loop.
