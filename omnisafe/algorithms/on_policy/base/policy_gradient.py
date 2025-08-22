@@ -245,6 +245,8 @@ class PolicyGradient(BaseAlgo):
         self._logger.register_key('Risk/TrainStatusCode', window_length=100)
         self._logger.register_key('Risk/TrainStatusMsgLen', window_length=100)
         self._logger.register_key('Risk/TrainSamples')
+        # NaN / Inf event counter for risk head (sanity diagnostics)
+        self._logger.register_key('Risk/NanEvents')
 
         # Semantic telemetry (raw margin diagnostics & schedule)
         win = wl
@@ -439,26 +441,23 @@ class PolicyGradient(BaseAlgo):
                     example_emb = self._semantic_manager.get_recent_risk_batch()  # type: ignore[attr-defined]
                     in_dim = example_emb.shape[1] if example_emb is not None else 512
                     risk_device = getattr(self._semantic_manager, 'model_device', self._device)  # type: ignore[attr-defined]
-                    self._risk_head = SemanticRiskHead(in_dim).to(risk_device)
-                    try:
-                        clip_dtype = next(self._semantic_manager.clip_model.parameters()).dtype  # type: ignore[attr-defined]
-                        if clip_dtype in (torch.bfloat16, torch.float16):
-                            self._risk_head = self._risk_head.to(dtype=clip_dtype)
-                    except Exception:  # noqa: BLE001
-                        pass
+                    # Keep risk head in float32 for numerical stability even if encoder is fp16/bf16.
+                    self._risk_head = SemanticRiskHead(in_dim).to(risk_device).float()
                     risk_lr = getattr(sem_cfg, 'risk_lr', 1e-3)
                     self._risk_opt = torch.optim.Adam(self._risk_head.parameters(), lr=risk_lr)
                 batch_embs = self._semantic_manager.get_recent_risk_batch()  # type: ignore[attr-defined]
                 train_status_code = None  # 0=trained, 1=no_embeddings, 2=too_few_embeddings, 3=targets_none
                 train_status_msg = ''
                 samples_used = 0
+                nan_events = 0
                 min_samples = int(getattr(sem_cfg, 'risk_min_samples', 5))
                 if batch_embs is not None and batch_embs.shape[0] >= min_samples:
                     risk_device = next(self._risk_head.parameters()).device
-                    rh_dtype = next(self._risk_head.parameters()).dtype
-                    full_embs = batch_embs.to(risk_device)
-                    if full_embs.dtype != rh_dtype:
-                        full_embs = full_embs.to(dtype=rh_dtype)
+                    full_embs = batch_embs.to(risk_device, dtype=torch.float32)
+                    # Sanitize embeddings (replace NaN/Inf with zeros)
+                    if not torch.isfinite(full_embs).all():
+                        full_embs = torch.nan_to_num(full_embs, nan=0.0, posinf=0.0, neginf=0.0)
+                        nan_events += 1
                     horizon = getattr(sem_cfg, 'risk_horizon', 64)
                     gamma = getattr(sem_cfg, 'discount', 0.99)
                     episode_mask_enable = getattr(sem_cfg, 'risk_episode_mask_enable', True)
@@ -505,8 +504,19 @@ class PolicyGradient(BaseAlgo):
                             train_status_code = 3
                             train_status_msg = 'targets_none'
                             break
-                        preds = self._risk_head(embs)
+                        # Sanitize targets
+                        if not torch.isfinite(targets).all():
+                            targets = torch.nan_to_num(targets, nan=0.0, posinf=0.0, neginf=0.0)
+                            nan_events += 1
+                        preds = self._risk_head(embs.float())
+                        if not torch.isfinite(preds).all():
+                            preds = torch.nan_to_num(preds, nan=0.0, posinf=0.0, neginf=0.0)
+                            nan_events += 1
                         loss_t = torch.nn.functional.smooth_l1_loss(preds.float(), targets.float())
+                        if not torch.isfinite(loss_t):
+                            # Skip this iteration; count event and continue.
+                            nan_events += 1
+                            continue
                         self._risk_opt.zero_grad()
                         loss_t.backward()
                         self._risk_opt.step()
@@ -547,6 +557,8 @@ class PolicyGradient(BaseAlgo):
                             log_dict['Risk/Corr'] = corr_val
                         log_dict['Risk/TrainStatusCode'] = float(train_status_code)
                         log_dict['Risk/TrainStatusMsgLen'] = float(len(train_status_msg))
+                        if nan_events > 0:
+                            log_dict['Risk/NanEvents'] = float(nan_events)
                         self._logger.store(log_dict)
                 else:
                     if batch_embs is None:
@@ -565,6 +577,7 @@ class PolicyGradient(BaseAlgo):
                         'Risk/TrainStatusMsgLen': float(len(train_status_msg)),
                         'Risk/Buf/Embeddings': float(0 if batch_embs is None else batch_embs.shape[0]),
                         'Risk/TrainSamples': float(0),
+                        'Risk/NanEvents': float(0),
                     })
 
     def _update_reward_critic(self, obs: torch.Tensor, target_value_r: torch.Tensor) -> None:

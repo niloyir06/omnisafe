@@ -15,7 +15,7 @@ from typing import List, Optional, Deque, Sequence
 from collections import deque
 import time
 import torch
-from transformers import CLIPModel, CLIPProcessor  # type: ignore
+from transformers import AutoModel, AutoProcessor  # type: ignore
 
 
 
@@ -34,12 +34,20 @@ class SemanticConfig:
     shaping_enable: bool = False
     risk_enable: bool = False
     modulation_enable: bool = False
+    # Minimum completed episodes before modulation is allowed (gating)
+    modulation_min_episodes: int = 0
     # Risk head learning rate (instead of hard-coded value)
     risk_lr: float = 1e-3
     risk_horizon: int = 64
     discount: float = 0.99
     # Episode-aware masking for risk targets (reset at terminals)
     risk_episode_mask_enable: bool = True
+    # Minimum samples required before attempting a risk head update.
+    risk_min_samples: int = 5
+    # Optional mini-batch size for risk head updates (0 => use full available batch).
+    risk_batch_size: int = 0
+    # Number of risk update iterations per PPO epoch (>=1). When >1 with mini-batching, draws fresh samples each iter.
+    risk_update_iters: int = 1
     alpha_modulation: float = 2.0
     threshold_percentile: int = 60
     slope: float = 5.0
@@ -65,6 +73,11 @@ class SemanticConfig:
     batch_across_envs: bool = True  # attempt to embed all env frames together
     batch_max: int = 32  # safety cap for very large vector_env_nums
     oom_backoff: bool = True  # on CUDA OOM during batch embedding, halve batch and retry
+    # Temporal window for pooled semantic embedding (1 = disabled). When >1 the shaping term
+    # uses the mean of the last N frame embeddings (warm-up: mean over available < N).
+    temporal_window: int = 6
+    # Simplicity toggle: when True use a stripped-down code path (single dtype load, no silent fallbacks/backoffs)
+    simple_mode: bool = True
 
 
 class SemanticManager:
@@ -75,6 +88,8 @@ class SemanticManager:
     costs: Deque[float]
     dones: Deque[bool]
     _margins: Deque[float]
+    _temporal_windows: List[Deque[torch.Tensor]]
+    _prev_phi_env: List[Optional[float]]
 
     def __init__(self, cfg: SemanticConfig, total_steps: int) -> None:
         self.cfg = cfg
@@ -109,51 +124,91 @@ class SemanticManager:
         self._clipped_margins = 0
         self._capture_count = 0  # number of embedding capture events (single or batched)
         self._last_capture_step = -1  # for effective interval telemetry
-        # Potential shaping state
-        self._prev_phi = None
+        # Episode counter for modulation gating
+        self.episodes_completed = 0
+        # Per-env temporal embedding windows (allocated lazily on first multi-step capture)
+        self._tw = max(1, int(getattr(self.cfg, 'temporal_window', 1)))
+        self._temporal_windows = []  # type: ignore[var-annotated]
+        # Per-env previous phi for potential shaping (avoid cross-env leakage)
+        self._prev_phi_env = []
+        # One-time warning flag if embeddings never populate while captures succeed
+        self._empty_buf_warned = True
+        # Enforce minimum window size to actually retain samples
+        if self.cfg.window_size < 1:
+            self.cfg.window_size = 1
+            self.embeddings = deque(maxlen=1)
+            self.costs = deque(maxlen=1)
+            self.dones = deque(maxlen=1)
 
     def _load_clip_and_prompts(self) -> None:
         if not self.cfg.enable:
             return
-        dtypes = [torch.bfloat16, torch.float16, torch.float32]
-        last_err: Optional[Exception] = None
-        for dt in dtypes:
-            try:
-                # Enforce safetensors usage for security/performance.
-                self.clip_model = CLIPModel.from_pretrained(
-                    self.cfg.model_name,
-                    torch_dtype=dt,
-                    use_safetensors=True,
-                )  # type: ignore[attr-defined]
-                self.clip_model.to(self.model_device)  # type: ignore[attr-defined]
-                self.clip_model.eval()
-                self.clip_proc = CLIPProcessor.from_pretrained(self.cfg.model_name)  # type: ignore[attr-defined]
-                with torch.no_grad():
-                    safe_tok = self.clip_proc(text=self.cfg.safe_prompts, return_tensors="pt", padding=True)
-                    safe_tok = {k: v.to(self.model_device) for k, v in safe_tok.items()}
-                    se = self.clip_model.get_text_features(**safe_tok)
-                    self.safe_centroid = torch.nn.functional.normalize(se.mean(0, keepdim=True), dim=-1).to(self.host_device)
-                    if self.host_device.type == 'cpu':  # keep GPU centroids in reduced precision
-                        self.safe_centroid = self.safe_centroid.float()
-                    unsafe_tok = self.clip_proc(text=self.cfg.unsafe_prompts, return_tensors="pt", padding=True)
-                    unsafe_tok = {k: v.to(self.model_device) for k, v in unsafe_tok.items()}
-                    ue = self.clip_model.get_text_features(**unsafe_tok)
-                    self.unsafe_centroid = torch.nn.functional.normalize(ue.mean(0, keepdim=True), dim=-1).to(self.host_device)
-                    if self.host_device.type == 'cpu':
-                        self.unsafe_centroid = self.unsafe_centroid.float()
-                self._clip_ready = True
-                self._clip_status = f'ok_st_{str(dt).split(".")[-1]}'
-                break
-            except Exception as e:  # noqa: BLE001
-                last_err = e
-                continue
-        if not self._clip_ready:
-            # Distinguish safetensors absence from other errors if possible
-            err_name = type(last_err).__name__ if last_err else "unknown"
-            msg = str(last_err) if last_err else ""
-            if 'safetensors' in msg.lower() and 'not found' in msg.lower():
-                err_name = 'NoSafeTensorsWeights'
-            self._clip_status = f'load_error:{err_name}'
+        if self.cfg.simple_mode:
+            # Unified loader for CLIP or SigLIP(2) via AutoModel/AutoProcessor.
+            dt = torch.float16 if (self.model_device.type == 'cuda') else torch.float32
+            self.clip_model = AutoModel.from_pretrained(  # CLIPModel or SiglipModel resolved automatically
+                self.cfg.model_name,
+                torch_dtype=dt,
+                use_safetensors=True,
+            )  # type: ignore[attr-defined]
+            self.clip_model.to(self.model_device)  # type: ignore[attr-defined]
+            self.clip_model.eval()
+            self.clip_proc = AutoProcessor.from_pretrained(self.cfg.model_name)  # type: ignore[attr-defined]
+            with torch.no_grad():
+                safe_tok = self.clip_proc(text=self.cfg.safe_prompts, return_tensors="pt", padding=True)
+                safe_tok = {k: v.to(self.model_device) for k, v in safe_tok.items()}
+                se = self.clip_model.get_text_features(**safe_tok)
+                self.safe_centroid = torch.nn.functional.normalize(se.mean(0, keepdim=True), dim=-1).to(self.host_device)
+                unsafe_tok = self.clip_proc(text=self.cfg.unsafe_prompts, return_tensors="pt", padding=True)
+                unsafe_tok = {k: v.to(self.model_device) for k, v in unsafe_tok.items()}
+                ue = self.clip_model.get_text_features(**unsafe_tok)
+                self.unsafe_centroid = torch.nn.functional.normalize(ue.mean(0, keepdim=True), dim=-1).to(self.host_device)
+                if self.host_device.type == 'cpu':
+                    self.safe_centroid = self.safe_centroid.float()
+                    self.unsafe_centroid = self.unsafe_centroid.float()
+            self._clip_ready = True
+            family = 'siglip' if 'siglip' in self.cfg.model_name.lower() else 'clip'
+            self._clip_status = f"ok_simple_{family}_{str(dt).split('.')[-1]}"
+        else:
+            # Original multi-dtype fallback retained (can be removed later if not needed)
+            dtypes = [torch.bfloat16, torch.float16, torch.float32]
+            last_err: Optional[Exception] = None
+            for dt in dtypes:
+                try:
+                    self.clip_model = AutoModel.from_pretrained(
+                        self.cfg.model_name,
+                        torch_dtype=dt,
+                        use_safetensors=True,
+                    )  # type: ignore[attr-defined]
+                    self.clip_model.to(self.model_device)  # type: ignore[attr-defined]
+                    self.clip_model.eval()
+                    self.clip_proc = AutoProcessor.from_pretrained(self.cfg.model_name)  # type: ignore[attr-defined]
+                    with torch.no_grad():
+                        safe_tok = self.clip_proc(text=self.cfg.safe_prompts, return_tensors="pt", padding=True)
+                        safe_tok = {k: v.to(self.model_device) for k, v in safe_tok.items()}
+                        se = self.clip_model.get_text_features(**safe_tok)
+                        self.safe_centroid = torch.nn.functional.normalize(se.mean(0, keepdim=True), dim=-1).to(self.host_device)
+                        if self.host_device.type == 'cpu':
+                            self.safe_centroid = self.safe_centroid.float()
+                        unsafe_tok = self.clip_proc(text=self.cfg.unsafe_prompts, return_tensors="pt", padding=True)
+                        unsafe_tok = {k: v.to(self.model_device) for k, v in unsafe_tok.items()}
+                        ue = self.clip_model.get_text_features(**unsafe_tok)
+                        self.unsafe_centroid = torch.nn.functional.normalize(ue.mean(0, keepdim=True), dim=-1).to(self.host_device)
+                        if self.host_device.type == 'cpu':
+                            self.unsafe_centroid = self.unsafe_centroid.float()
+                    self._clip_ready = True
+                    family = 'siglip' if 'siglip' in self.cfg.model_name.lower() else 'clip'
+                    self._clip_status = f"ok_st_{family}_{str(dt).split('.')[-1]}"
+                    break
+                except Exception as e:  # noqa: BLE001
+                    last_err = e
+                    continue
+            if not self._clip_ready:
+                err_name = type(last_err).__name__ if last_err else "unknown"
+                msg = str(last_err) if last_err else ""
+                if 'safetensors' in msg.lower() and 'not found' in msg.lower():
+                    err_name = 'NoSafeTensorsWeights'
+                self._clip_status = f'load_error:{err_name}'
 
     def is_ready(self) -> bool:
         return self._clip_ready
@@ -161,21 +216,18 @@ class SemanticManager:
     def maybe_compute_embedding(self, frame) -> Optional[torch.Tensor]:
         if not self._clip_ready:
             return None
+        self._capture_count += 1
+        self._last_capture_step = self.global_step
         start = time.time()
-        try:
-            self._capture_count += 1
-            self._last_capture_step = self.global_step
-            with torch.no_grad():
-                batch = self.clip_proc(images=frame, return_tensors="pt")
-                batch = {k: v.to(self.model_device) for k, v in batch.items()}
-                img_feat = self.clip_model.get_image_features(**batch)
-                img_feat = torch.nn.functional.normalize(img_feat, dim=-1).to(self.host_device)
-                if self.host_device.type == 'cpu':
-                    img_feat = img_feat.float()
-            self.last_embed_latency_ms = (time.time() - start) * 1000
-            return img_feat[0]
-        except Exception:  # noqa: BLE001
-            return None
+        with torch.no_grad():
+            batch = self.clip_proc(images=frame, return_tensors="pt")
+            batch = {k: v.to(self.model_device) for k, v in batch.items()}
+            img_feat = self.clip_model.get_image_features(**batch)
+            img_feat = torch.nn.functional.normalize(img_feat, dim=-1).to(self.host_device)
+            if self.host_device.type == 'cpu':
+                img_feat = img_feat.float()
+        self.last_embed_latency_ms = (time.time() - start) * 1000
+        return img_feat[0]
 
     # ---- Batched embeddings ----
     def maybe_compute_embeddings(self, frames: Sequence) -> List[Optional[torch.Tensor]]:  # type: ignore[override]
@@ -186,50 +238,57 @@ class SemanticManager:
         """
         if not self._clip_ready or not frames:
             return [None for _ in frames]
-        # Clamp batch size
         frames = list(frames)[: self.cfg.batch_max]
         self._capture_count += 1
         self._last_capture_step = self.global_step
-
-        def _embed(list_frames: List):  # recursive helper
-            start = time.time()
-            try:
-                with torch.no_grad():
-                    batch = self.clip_proc(images=list_frames, return_tensors="pt")
-                    batch = {k: v.to(self.model_device) for k, v in batch.items()}
-                    img_feats = self.clip_model.get_image_features(**batch)
-                    img_feats = torch.nn.functional.normalize(img_feats, dim=-1).to(self.host_device)
-                    if self.host_device.type == 'cpu':
-                        img_feats = img_feats.float()
-                latency = (time.time() - start) * 1000
-                # average latency per frame for logging (approx)
-                self.last_embed_latency_ms = latency / max(1, len(list_frames))
-                return [img_feats[i] for i in range(img_feats.shape[0])]
-            except RuntimeError as e:  # potential OOM
-                if self.cfg.oom_backoff and 'out of memory' in str(e).lower() and len(list_frames) > 1:
-                    mid = len(list_frames) // 2
-                    left = _embed(list_frames[:mid])
-                    right = _embed(list_frames[mid:])
-                    return left + right
-                return [None for _ in list_frames]
-            except Exception:  # noqa: BLE001
-                return [None for _ in list_frames]
-
-        embeddings_list = _embed(frames)
-        # Pad if recursive splitting shrunk? (Should remain aligned.)
-        if len(embeddings_list) != len(frames):  # safety
-            return [None for _ in frames]
-        # Ensure Optional typing consistency
-        typed_list: List[Optional[torch.Tensor]] = [e if isinstance(e, torch.Tensor) else None for e in embeddings_list]
-        return typed_list
+        start = time.time()
+        with torch.no_grad():
+            batch = self.clip_proc(images=frames, return_tensors="pt")
+            batch = {k: v.to(self.model_device) for k, v in batch.items()}
+            img_feats = self.clip_model.get_image_features(**batch)
+            img_feats = torch.nn.functional.normalize(img_feats, dim=-1).to(self.host_device)
+            if self.host_device.type == 'cpu':
+                img_feats = img_feats.float()
+        latency = (time.time() - start) * 1000
+        self.last_embed_latency_ms = latency / max(1, len(frames))
+        return [img_feats[i] for i in range(img_feats.shape[0])]
 
     # ------------- Shaping ------------------
     def shaping_term(self, embedding: torch.Tensor) -> float:
+        shaping, _ = self.compute_shaping_and_eff(embedding)
+        return shaping
+
+    def _ensure_env(self, env_idx: int) -> None:
+        if env_idx >= len(self._temporal_windows):
+            # Grow lists up to env_idx inclusive
+            for _ in range(env_idx - len(self._temporal_windows) + 1):
+                self._temporal_windows.append(deque(maxlen=self._tw))
+                self._prev_phi_env.append(None)
+
+    def effective_embedding(self, embedding: torch.Tensor, env_idx: int = 0) -> torch.Tensor:
+        """Return (and update) per-env pooled embedding for shaping/risk.
+
+        Maintains separate temporal deque per environment to prevent cross-env leakage.
+        Warm-up: mean over available entries (< window size). If window disabled returns original.
+        """
+        if self._tw <= 1:
+            return embedding
+        self._ensure_env(env_idx)
+        window = self._temporal_windows[env_idx]
+        window.append(embedding.detach())
+        return torch.stack(list(window), dim=0).mean(0)
+
+    def compute_shaping_and_eff(self, embedding: torch.Tensor, env_idx: int = 0) -> tuple[float, torch.Tensor]:
+        """Compute shaping term and return (shaping, effective_embedding).
+
+        If shaping disabled or CLIP not ready, returns (0.0, pooled_embedding_or_raw).
+        """
+        eff_emb = self.effective_embedding(embedding, env_idx=env_idx)
         if not (self.cfg.shaping_enable and self._clip_ready and self.safe_centroid is not None and self.unsafe_centroid is not None):
-            return 0.0
+            return 0.0, eff_emb
         with torch.no_grad():
-            safe_sim = torch.matmul(embedding, self.safe_centroid[0])
-            unsafe_sim = torch.matmul(embedding, self.unsafe_centroid[0])
+            safe_sim = torch.matmul(eff_emb, self.safe_centroid[0])
+            unsafe_sim = torch.matmul(eff_emb, self.unsafe_centroid[0])
             margin = (safe_sim - unsafe_sim).item()
         margin *= self.cfg.margin_scale
         norm_margin = margin
@@ -242,13 +301,15 @@ class SemanticManager:
                 norm_margin = (margin - m) / std
         beta = self._beta_schedule()
         clipped_norm = max(min(norm_margin, 2.0), -2.0)
-        phi = norm_margin  # un-clipped potential
+        phi = norm_margin
         if self.cfg.potential_enable:
-            if self._prev_phi is None:
+            self._ensure_env(env_idx)
+            prev_phi = self._prev_phi_env[env_idx]
+            if prev_phi is None:
                 shaping = 0.0
             else:
-                shaping = beta * (self.cfg.discount * phi - self._prev_phi)
-            self._prev_phi = phi
+                shaping = beta * (self.cfg.discount * phi - prev_phi)
+            self._prev_phi_env[env_idx] = phi
         else:
             shaping = beta * clipped_norm
         # Telemetry updates
@@ -258,32 +319,48 @@ class SemanticManager:
         self._total_margins += 1
         if clipped_norm != norm_margin:
             self._clipped_margins += 1
-        return shaping
+        return shaping, eff_emb
 
     # --- Telemetry accessors (lightweight) ---
     def debug_metrics(self) -> dict[str, float]:
-        """Return latest semantic telemetry metrics.
+        """Return semantic & risk diagnostics (fills all registered keys if possible).
 
-        Consumers (adapter) can log these without recomputation.
+        Previously we registered several logger keys (RawMargin, ClampFrac, CaptureIntervalEffective,
+        Risk/Buf/Costs, Risk/Buf/Dones) but did not actually emit values. This richer dict ensures
+        downstream logs reflect real buffer & margin state, reducing silent failure modes when the
+        risk head appears inactive.
         """
-        clamp_frac = (
-            float(self._clipped_margins) / float(self._total_margins)
-            if self._total_margins > 0
-            else 0.0
-        )
-        effective_interval = (
-            float(self.global_step - self._last_capture_step)
-            if self._last_capture_step >= 0
-            else 0.0
-        )
-        return {
-            'Semantics/RawMargin': self._last_margin_raw,
-            'Semantics/NormMargin': self._last_margin_norm,
+        # Clamp fraction (avoid div-by-zero)
+        clamp_frac = 0.0
+        if self._total_margins > 0:
+            clamp_frac = float(self._clipped_margins) / float(self._total_margins)
+        # Effective interval since last capture (0 if a capture happened this step or never captured)
+        if self._last_capture_step < 0:
+            eff_interval = 0.0
+        else:
+            eff_interval = float(self.global_step - self._last_capture_step)
+        # Risk buffers
+        buf_emb = float(len(self.embeddings))
+        buf_cost = float(len(self.costs))
+        buf_done = float(len(self.dones))
+        metrics = {
             'Semantics/Beta': self._last_beta,
+            'Semantics/NormMargin': self._last_margin_norm,
+            'Semantics/RawMargin': self._last_margin_raw,
             'Semantics/ClampFrac': clamp_frac,
             'Semantics/CaptureCount': float(self._capture_count),
-            'Semantics/CaptureIntervalEffective': effective_interval,
+            'Semantics/CaptureIntervalEffective': eff_interval,
+            'Risk/Buf/Embeddings': buf_emb,
+            'Risk/Buf/Costs': buf_cost,
+            'Risk/Buf/Dones': buf_done,
         }
+        return metrics
+
+    def _avg_window_fill(self) -> float:
+        if self._tw <= 1 or not self._temporal_windows:
+            return 0.0
+        fills = [len(w) / float(self._tw) for w in self._temporal_windows]
+        return float(sum(fills) / len(fills)) if fills else 0.0
 
     def _beta_schedule(self) -> float:
         steps_end = int(self.total_steps * self.cfg.beta_end_step_fraction)
@@ -294,15 +371,21 @@ class SemanticManager:
         prog = self.global_step / steps_end
         return self.cfg.beta_start * 0.5 * (1 + torch.cos(torch.tensor(prog * 3.1415926535))).item()
 
-    def record_step(self, embedding: Optional[torch.Tensor], cost: float, done: bool = False) -> None:
-        if embedding is not None and self.cfg.risk_enable:
-            # Keep embedding on host_device; if host is GPU we avoid cpu sync.
-            emb_store = embedding.detach()
+    def record_step(self, embedding: Optional[torch.Tensor], cost: float, done: bool = False, env_idx: int = 0) -> None:
+        """Record a single-env capture step (legacy single-frame path).
+
+        Episode counting removed (centralized in mark_episode_end). Temporal pooling per env only.
+        """
+        if embedding is not None:
+            eff_emb = self.effective_embedding(embedding, env_idx=env_idx)
+            emb_store = eff_emb.detach()
             if self.host_device.type == 'cpu':
                 emb_store = emb_store.cpu()
+            before = len(self.embeddings)
             self.embeddings.append(emb_store)
             self.costs.append(cost)
             self.dones.append(done)
+            after = len(self.embeddings)
         self.global_step += 1
 
     def record_multi_step(self, embeddings: List[Optional[torch.Tensor]], costs: List[float], dones: Optional[List[bool]] = None) -> None:
@@ -310,22 +393,44 @@ class SemanticManager:
 
         Increments global_step exactly once to maintain shaping schedule consistency.
         """
-        if self.cfg.risk_enable:
-            if dones is None:
-                dones = [False] * len(costs)
-            filtered_dones: List[bool] = []
-            for emb, c, d in zip(embeddings, costs, dones):
-                if emb is None:
-                    continue
-                emb_store = emb.detach()
-                if self.host_device.type == 'cpu':
-                    emb_store = emb_store.cpu()
-                self.embeddings.append(emb_store)
-                self.costs.append(c)
-                filtered_dones.append(d)
-            for d in filtered_dones:
-                self.dones.append(d)
+        if dones is None:
+            dones = [False] * len(costs)
+        for idx, (emb, c, d) in enumerate(zip(embeddings, costs, dones)):
+            if emb is None:
+                continue
+            eff_emb = self.effective_embedding(emb, env_idx=idx)
+            emb_store = eff_emb.detach()
+            if self.host_device.type == 'cpu':
+                emb_store = emb_store.cpu()
+            before = len(self.embeddings)
+            self.embeddings.append(emb_store)
+            self.costs.append(c)
+            self.dones.append(d)
+            after = len(self.embeddings)
         self.global_step += 1
+        # (Episode counting centralized in mark_episode_end.)
+
+    def count_episode_dones(self, dones: List[bool]) -> None:  # kept for backward compatibility (no-op)
+        return
+
+    # --- Centralized episode end marking (adapter can call once per true env episode) ---
+    def mark_episode_end(self, count: int = 1, env_indices: Optional[List[int]] = None) -> None:
+        """Record completed episodes explicitly (single source of truth).
+
+        If env_indices provided, clear temporal windows & potential phi for those envs only.
+        """
+        if count <= 0:
+            return
+        self.episodes_completed += int(count)
+        if env_indices and self._tw > 1:
+            for idx in env_indices:
+                if idx < len(self._temporal_windows):
+                    self._temporal_windows[idx].clear()
+                if idx < len(self._prev_phi_env):
+                    self._prev_phi_env[idx] = None
+        elif self._tw > 1 and not env_indices:
+            # Fallback: if indices unknown, do nothing (avoid wiping all env history)
+            pass
 
     def advance_step(self) -> None:
         """Advance global step without recording embeddings (no capture this step)."""
@@ -337,46 +442,28 @@ class SemanticManager:
         return torch.stack(list(self.embeddings), dim=0)
 
     def build_episode_masked_targets(self, gamma: float, horizon: int) -> Optional[torch.Tensor]:
-        """Episode-aware discounted cost targets with horizon cap.
-
-        Resets accumulation after terminal states using recorded done flags.
-        """
+        """Episode-aware discounted cost targets with horizon cap."""
         if not self.embeddings or not self.costs:
             return None
         costs = torch.tensor(list(self.costs), dtype=torch.float32)
         dones_list = list(self.dones)
-        # Align length (legacy entries may lack dones; assume False)
+        # Align length
         if len(dones_list) < len(costs):
-            pad = [False] * (len(costs) - len(dones_list))
-            dones_list = pad + dones_list
+            dones_list.extend([False] * (len(costs) - len(dones_list)))
+        
         L = len(costs)
         targets = torch.zeros(L, dtype=torch.float32)
-        # Backward pass resetting at terminals
-        running = 0.0
-        look = 0
-        for i in range(L - 1, -1, -1):
-            if dones_list[i]:
-                running = 0.0
-                look = 0
-            if look >= horizon:
-                running = 0.0
-                look = 0
-            running = costs[i].item() + gamma * running
-            targets[i] = running
-            look += 1
-        # Forward refinement for strict horizon & terminal stop
-        if horizon < L:
-            pow_cache = torch.tensor([gamma ** k for k in range(horizon)], dtype=torch.float32)
-            for i in range(L):
-                acc = 0.0
-                for k in range(horizon):
-                    j = i + k
-                    if j >= L:
-                        break
-                    acc += pow_cache[k] * costs[j].item()
-                    if dones_list[j]:
-                        break
-                targets[i] = acc
+        disc_powers = torch.tensor([gamma ** k for k in range(horizon)], dtype=torch.float32)
+        
+        # Single forward pass with episode reset
+        for i in range(L):
+            acc = 0.0
+            for k in range(horizon):
+                j = i + k
+                if j >= L or dones_list[j]:
+                    break
+                acc += disc_powers[k] * costs[j].item()
+            targets[i] = acc
         return targets
 
     def estimated_mean_risk(self, risk_head: Optional[torch.nn.Module]) -> Optional[float]:
@@ -390,47 +477,33 @@ class SemanticManager:
     def modulation_scale(self, risk_head: Optional[torch.nn.Module]) -> Optional[float]:
         if not (self.cfg.modulation_enable and risk_head and self.embeddings):
             return None
-        def _safe_return(val: float) -> float:
-            # Ensure final value finite and positive
-            if not (val > 0) or not torch.isfinite(torch.tensor(val)):
-                return 1.0
-            return float(val)
+        # Gating: require minimum completed episodes
+        if self.episodes_completed < getattr(self.cfg, 'modulation_min_episodes', 0):
+            return 1.0
+            
         with torch.no_grad():
             try:
                 embs = torch.stack(list(self.embeddings), dim=0).to(next(risk_head.parameters()).device)
                 preds = risk_head(embs).flatten()
-            except Exception:
-                return 1.0
-            # Filter out non-finite predictions
-            finite_mask = torch.isfinite(preds)
-            preds = preds[finite_mask]
-            if preds.numel() < 10:
-                return 1.0
-            # Quantile & mean (guard against NaN)
-            try:
-                q_level = float(self.cfg.threshold_percentile) / 100.0
-                q_level = min(max(q_level, 0.0), 1.0)
+                # Filter finite predictions
+                preds = preds[torch.isfinite(preds)]
+                if preds.numel() < 10:
+                    return 1.0
+                    
+                q_level = max(0.0, min(1.0, self.cfg.threshold_percentile / 100.0))
                 perc = torch.quantile(preds, q_level)
                 mean_pred = preds.mean()
+                
+                if not (torch.isfinite(perc) and torch.isfinite(mean_pred)):
+                    return 1.0
+                    
+                slope = max(1e-6, getattr(self.cfg, 'slope', 5.0))
+                slope_scale = perc / slope if abs(perc.item()) > 1e-6 else 1.0
+                diff = mean_pred - perc
+                arg = (diff / (slope_scale + 1e-6)).clamp(-20.0, 20.0)
+                gate = torch.sigmoid(arg)
+                alpha = getattr(self.cfg, 'alpha_modulation', 2.0)
+                scale = 1.0 / (1.0 + alpha * gate.item())
+                return max(0.01, min(10.0, scale))  # reasonable bounds
             except Exception:
                 return 1.0
-            if not (torch.isfinite(perc) and torch.isfinite(mean_pred)):
-                return 1.0
-            slope = float(getattr(self.cfg, 'slope', 5.0) or 0.0)
-            if slope <= 0:
-                slope = 5.0  # fallback default
-            if abs(perc.item()) > 1e-6:
-                slope_scale = perc / slope
-            else:
-                slope_scale = torch.tensor(1.0, device=preds.device)
-            if not torch.isfinite(slope_scale):
-                slope_scale = torch.tensor(1.0, device=preds.device)
-            diff = mean_pred - perc
-            # Normalize & clamp argument to sigmoid to avoid overflow & NaNs
-            arg = (diff / (slope_scale + 1e-6)).clamp(min=-20.0, max=20.0)
-            gate = torch.sigmoid(arg)
-            alpha = float(getattr(self.cfg, 'alpha_modulation', 2.0))
-            if not torch.isfinite(gate):
-                return 1.0
-            scale = 1.0 / (1.0 + alpha * gate.item())
-            return _safe_return(scale)

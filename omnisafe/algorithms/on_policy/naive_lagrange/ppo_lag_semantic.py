@@ -44,8 +44,13 @@ class PPOLagSem(PPOLag):  # pragma: no cover simple wiring
                 shaping_enable=getattr(sem_cfg, 'shaping_enable', False),
                 risk_enable=getattr(sem_cfg, 'risk_enable', False),
                 modulation_enable=getattr(sem_cfg, 'modulation_enable', False),
+                modulation_min_episodes=getattr(sem_cfg, 'modulation_min_episodes', 0),
                 risk_horizon=getattr(sem_cfg, 'risk_horizon', 64),
                 discount=getattr(sem_cfg, 'discount', 0.99),
+                risk_episode_mask_enable=getattr(sem_cfg, 'risk_episode_mask_enable', True),
+                risk_min_samples=getattr(sem_cfg, 'risk_min_samples', 5),
+                risk_batch_size=getattr(sem_cfg, 'risk_batch_size', 0),
+                risk_update_iters=getattr(sem_cfg, 'risk_update_iters', 1),
                 alpha_modulation=getattr(sem_cfg, 'alpha_modulation', 2.0),
                 threshold_percentile=getattr(sem_cfg, 'threshold_percentile', 60),
                 slope=getattr(sem_cfg, 'slope', 5.0),
@@ -60,6 +65,14 @@ class PPOLagSem(PPOLag):  # pragma: no cover simple wiring
                 batch_max=getattr(sem_cfg, 'batch_max', 32),
                 oom_backoff=getattr(sem_cfg, 'oom_backoff', True),
             )
+            # Debug: print semantic configuration once at init so user can verify values.
+            try:
+                from dataclasses import asdict  # local import (std lib)
+                print('[SemanticConfig Init]', asdict(sem_conf))
+            except Exception:  # noqa: BLE001
+                # Fallback to repr if asdict fails for any reason
+                print('[SemanticConfig Init]', sem_conf)
+
             self._semantic_manager = SemanticManager(sem_conf, self._cfgs.train_cfgs.total_steps)
             # replace env adapter keeping same env id & num envs
             self._env = SemanticOnPolicyAdapter(  # type: ignore[attr-defined]
@@ -102,7 +115,12 @@ class PPOLagSem(PPOLag):  # pragma: no cover simple wiring
         # Proceed with normal actor/critic + risk head update via superclass chain (PolicyGradient)
         # Invoke base PolicyGradient update (actor/critic + risk head hook) directly
         PolicyGradient._update(self)  # type: ignore[misc]
-        # Log lambda
+        # Log lambda & modulation (always log scale for contiguous series)
         self._logger.store({'Metrics/LagrangeMultiplier': self._lagrange.lagrangian_multiplier})  # type: ignore[attr-defined]
-        if scale != 1.0:
-            self._logger.store({'Risk/ModulationScale': scale})
+        self._logger.store({'Risk/ModulationScale': scale})
+        if hasattr(self, '_semantic_manager'):
+            # Episodes completed & whether gating active (1 if modulation allowed, else 0)
+            eps_done = getattr(self._semantic_manager, 'episodes_completed', 0)
+            min_eps = getattr(getattr(self._cfgs, 'semantic_cfgs', object()), 'modulation_min_episodes', 0)
+            active = 1.0 if eps_done >= min_eps else 0.0
+            self._logger.store({'Risk/ModulationActive': active})

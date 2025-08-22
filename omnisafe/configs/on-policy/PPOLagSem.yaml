@@ -13,7 +13,7 @@
 # limitations under the License.
 # ==============================================================================
 #
-# PPOLagSem configuration: PPO-Lagrangian with optional semantic (CLIP) shaping & risk head.
+# PPOLagSem configuration: PPO-Lagrangian with optional semantic (CLIP/SigLIP) shaping & risk head.
 # Mirrors PPOLag.yaml fields 1:1 plus an expanded semantic_cfgs block. All extra parameters are
 # strictly additive (disabled by default) so baseline parity is preserved when enable=False.
 
@@ -127,68 +127,114 @@ defaults:
     lambda_optimizer: "Adam"
   env_cfgs: {}
   semantic_cfgs:
-    # master enable switch for semantics (False = pure PPOLag parity)
+    # master enable switch for all semantic features. When False: no vision-language model is loaded,
+    # no extra memory/time overhead, rewards are untouched (parity with baseline PPOLag).
     enable: False
-    # embed every N environment steps (controls CLIP call frequency)
+    # capture interval (in env steps) between embedding extractions. Lower = denser shaping & risk data
+    # but higher wall-clock overhead. Effective semantic steps ≈ total_steps / capture_interval.
     capture_interval: 4
-    # image side length (CLIP expects 224 for ViT base variants)
+    # side length (pixels) each frame is resized/cropped to before CLIP. Must match model expectations.
+    # Smaller custom values reduce accuracy; 224 is the standard for ViT-B/16 & B/32 variants.
     frame_size: 224
-    # HuggingFace model id for CLIP
-    model_name: "openai/clip-vit-base-patch16"
-    # device for CLIP forward pass (can differ from policy device)
+    # HuggingFace model identifier for the vision-language encoder. Supports CLIP or SigLIP family models.
+    # Patch size / resolution trades speed vs fidelity (e.g., clip-vit-base-patch16 vs siglip-so400m-patch14-384).
+    # Changing this invalidates previously cached centroids; prompts will be re-embedded automatically.
+    # Examples:
+    #   CLIP   : openai/clip-vit-base-patch16
+    #   SigLIP : google/siglip2-so400m-patch16-512
+    model_name: "google/siglip2-so400m-patch16-512"
+    # device on which the (frozen) vision-language model runs. Use a GPU (cuda:0) for large capture frequency or many envs.
+      # If GPU not available it falls back to CPU automatically (status logged internally).
     model_device: cpu
-    # device where centroids & returned embeddings are stored (buffers)
+    # device where semantic centroids, pooled embeddings, and risk buffers live. Keeping this on CPU saves VRAM
+    # at the cost of extra host<->device transfers if the risk head is on GPU. Set to same GPU as model for
+    # maximum throughput when memory allows.
     host_device: cpu
-    # enable reward shaping using semantic margin
+    # enable semantic reward shaping (additive or potential per potential_enable). Uses embedding margin between
+    # safe and unsafe prompt centroids with annealed beta schedule. Disabled -> environment reward only.
     shaping_enable: False
-    # enable auxiliary risk head training
+    # enable auxiliary risk prediction head (embedding -> truncated discounted future cost). Provides extra
+    # representation signal and powers optional modulation. Adds one small MLP optimizer step per PPO epoch.
     risk_enable: False
-    # learning rate for auxiliary risk head (if enabled)
+    # learning rate for risk head optimizer (Adam). Tune lower if loss diverges; higher if loss plateaus quickly.
     risk_lr: 0.001
-    # episode-aware masking for risk targets (reset discounted accumulation at terminals)
+    # when True: discounted cost accumulation for targets resets at episode terminals, preventing leakage of
+    # post-terminal costs backward into previous episodes (crucial for multi-episode buffers).
     risk_episode_mask_enable: True
-    # enable (future) modulation of constraint updates using predicted risk
+    # enable adaptive scaling (currently conservative damping) of Lagrange multiplier learning rate using
+    # distributional statistics of recent risk predictions (quantile gap logistic gate).
     modulation_enable: False
-    # initial shaping coefficient
+    # minimum number of fully completed episodes before modulation is allowed (simple data sufficiency gate
+    # to avoid early noisy scaling). Until reached, modulation scale = 1.0.
+    modulation_min_episodes: 10
+    # initial (maximum) shaping coefficient beta_0. Governs early influence of semantic signal; interacts with
+    # normalization & margin_scale. Too high risks over-shaping; too low yields minimal curriculum effect.
     beta_start: 0.15
-    # fraction of total steps over which beta anneals to 0
+  # fraction of total training steps over which beta cosine-anneals from beta_start -> 0. Ensures shaping
+  # neutrality late in training. Larger fraction prolongs guidance; smaller fraction decays earlier.
     beta_end_step_fraction: 0.6
-    # horizon length (steps) for truncated discounted cost target
+    # prediction horizon (steps) used to build truncated discounted cost targets for the risk head. Larger horizon
+    # increases variance; smaller horizon increases bias (misses longer-tail costs).
     risk_horizon: 64
-    # discount used for risk target accumulation
+    # discount factor used specifically for constructing risk targets (can mirror cost_gamma). Adjust (slightly)
+    # lower than reward gamma to emphasize near-term safety if needed.
     discount: 0.99
-    # modulation scaling factor (future use)
+    # minimum number of buffered embeddings before attempting any risk head update (data sufficiency gate)
+    risk_min_samples: 5
+    # optional mini-batch size for risk head (0 = use full available batch). Tune for stochastic regularization vs speed.
+    risk_batch_size: 0
+    # number of risk head update iterations per PPO epoch (>=1). With mini-batching runs multiple sampled steps.
+    risk_update_iters: 1
+    # modulation alpha: scales the strength of logistic gate effect on λ learning rate. Higher -> stronger damping
+    # (lower final scale) given same gate activation.
     alpha_modulation: 2.0
-    # percentile threshold for modulation gating
+    # percentile (0-100) of risk prediction distribution used as reference threshold q_p. Contrasted with mean to
+    # form gap driving logistic gate. Mid-percentiles (50-70) usually stable.
     threshold_percentile: 60
-    # slope term used in logistic modulation shaping
+    # slope divisor controlling logistic gate sharpness; effective temperature ~ q_p / slope. Larger slope softens
+    # response; smaller slope sharpens (risk of instability if too small).
     slope: 5.0
-    # max stored embeddings/costs window (risk buffer)
+    # maximum number of (embedding, cost, done) entries retained for risk training & modulation stats. Caps memory
+    # and compute. When full, oldest entries are evicted FIFO.
     window_size: 2048
-    # window length for running mean/std of semantic margin (normalization)
+    # number of recent margins tracked for running mean/std when normalization enabled. Larger = smoother but slower
+    # to adapt if prompt distribution shifts; smaller = noisier normalization.
     norm_window: 1000
-    # enable z-normalization of semantic margin before clipping
+    # enable z-normalization (subtract running mean & divide by running std) before clipping to [-2,2]. Disabling
+    # leaves raw (scaled) margin; use margin_scale then to control magnitude to avoid extreme shaping.
     margin_norm_enable: True
-    # scale factor applied to raw (safe-unsafe) margin prior to normalization/clipping
+    # multiplicative factor applied to raw margin pre-normalization & pre-clamp. Use >1 to amplify weak semantic
+    # separation or <1 to temper strong margins before normalization/clipping.
     margin_scale: 1.0
-    # enable potential-based shaping (beta * (gamma * phi_next - phi_prev)); else additive beta*clipped_norm
+    # switch shaping formulation: True -> potential-based (beta * (gamma*phi_next - phi_prev)) offering theoretical
+    # policy invariance as beta→0; False -> additive (beta * clipped_norm_margin) which can speed very early learning.
     potential_enable: True
-    # prompts describing safe scenes
+    # list of natural language prompts describing *safe / desirable* visual states. Encoded once to a centroid.
+    # Edit to refine semantic signal (e.g., add context, objects, verbs). Keep concise & discriminative.
     safe_prompts: [
         "red car moving toward green goal",
         "clear path ahead to green goal",
         "red car aligned safely avoiding obstacles",
     ]
-    # prompts describing unsafe scenes
+    # list of prompts describing *unsafe / undesirable* states (collisions, hazards). Provide diverse failure modes
+    # without redundancy. Removing weak or ambiguous prompts can tighten margin distribution.
     unsafe_prompts: [
         "red car near purple obstacle collision",
         "red car pushing into blue cube hazard",
         "blocked path crowded with purple obstacles",
     ]
-    # enable spatial batching of embeddings across all parallel envs (per capture step)
+    # if True: collect one frame per parallel env at each capture step and embed as a single batch (better GPU
+    # utilization & per-env fidelity). If False: legacy single frame path (embedding broadcast across envs).
     batch_across_envs: True
-    # hard cap on batch size (frames) passed to CLIP each capture (protect VRAM)
+    # upper bound on batch size for a capture event (protects VRAM). If vector_env_nums exceeds this value frames
+    # beyond the cap are ignored this capture.
     batch_max: 32
-    # on CUDA OOM during batch embed, recursively halve batch and retry
+    # when True: on CUDA Out-Of-Memory during batch embedding, recursively halves the batch until success (>=1) or
+    # gives up (marking failures). Prevents hard crash on transient memory pressure.
     oom_backoff: True
     # Set batch_across_envs False to revert to legacy single-frame embedding path.
+    # temporal_window: size of rolling window (in capture events) for temporal mean pooling of embeddings.
+    # 1 disables temporal pooling (current frame only). For k>1 we maintain last k embeddings and use their mean
+    # as the effective embedding for shaping (warm-up uses mean over available <k). Suggested small values (e.g., 4–8)
+    # can reduce per-frame semantic noise without large delay. Episode boundaries clear the window.
+    temporal_window: 6

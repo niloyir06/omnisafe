@@ -41,27 +41,37 @@ class SemanticOnPolicyAdapter(OnPolicyAdapter):  # pragma: no cover minimal logi
         ):
             act, value_r, value_c, logp = agent.step(obs)
             next_obs, reward, cost, terminated, truncated, info = self.step(act)
+            # Preserve raw (environment) reward before semantic shaping for logging & ratios
+            base_reward = reward.clone() if torch.is_tensor(reward) else reward
             if self._semantic_manager.cfg.enable and (step % capture_interval == 0):
                 # Spatial batch path
                 if batch_mode:
+                    frames = []
+                    # Try to render once per env; fallback to single shared frame if vectorized env doesn't expose per-env render.
+                    base_frame = self._env.render()
+                    if isinstance(base_frame, list) and len(base_frame) == reward.shape[0]:  # already list of frames
+                        frames = base_frame
+                    else:
+                        # replicate same frame for all envs (best-effort)
+                        frames = [base_frame for _ in range(reward.shape[0])]
+                    self._embed_attempts += len(frames)
+                    embeddings = self._semantic_manager.maybe_compute_embeddings(frames)
+                    # Always derive per-env costs & dones for risk buffer regardless of simple_mode
+                    mean_costs = cost.detach().cpu().tolist()
                     try:
-                        frames = []
-                        # Try to render once per env; fallback to single shared frame if vectorized env doesn't expose per-env render.
-                        base_frame = self._env.render()
-                        if isinstance(base_frame, list) and len(base_frame) == reward.shape[0]:  # already list of frames
-                            frames = base_frame
-                        else:
-                            # replicate same frame for all envs (best-effort)
-                            frames = [base_frame for _ in range(reward.shape[0])]
-                        self._embed_attempts += len(frames)
-                        embeddings = self._semantic_manager.maybe_compute_embeddings(frames)
+                        dones_list = (terminated | truncated).detach().cpu().tolist()
+                    except Exception:  # noqa: BLE001
+                        dones_list = [False] * len(mean_costs)
+                    if getattr(self._semantic_manager.cfg, 'simple_mode', False):
+                        valid_ct = sum(1 for e in embeddings if e is not None)
                         shapings = []
                         success_ct = 0
                         if self._semantic_manager.cfg.shaping_enable:
                             for emb in embeddings:
                                 if emb is not None:
                                     success_ct += 1
-                                    shapings.append(self._semantic_manager.shaping_term(emb))
+                                    shaping_val, _ = self._semantic_manager.compute_shaping_and_eff(emb)
+                                    shapings.append(shaping_val)
                                 else:
                                     shapings.append(0.0)
                         else:
@@ -76,8 +86,8 @@ class SemanticOnPolicyAdapter(OnPolicyAdapter):  # pragma: no cover minimal logi
                         mean_shaping = shaping_tensor.mean()
                         logger.store({'Semantics/Shaping': mean_shaping})
                         try:
-                            raw_reward_mean = reward.mean() - mean_shaping  # remove shaping to approximate base
-                            if abs(raw_reward_mean) > 1e-6:
+                            raw_reward_mean = base_reward.mean() if hasattr(base_reward, 'mean') else base_reward
+                            if abs(float(raw_reward_mean)) > 1e-6:
                                 ratio = (mean_shaping / raw_reward_mean).clamp(-10, 10)
                                 logger.store({'Semantics/ShapingRewardRatio': ratio})
                         except Exception:
@@ -94,16 +104,8 @@ class SemanticOnPolicyAdapter(OnPolicyAdapter):  # pragma: no cover minimal logi
                         })
                         # Telemetry diagnostics (last embedding processed)
                         logger.store(self._semantic_manager.debug_metrics())
-                        # record risk data (use per-env mean cost element-wise) cost is vector length num_envs
-                        mean_costs = cost.detach().cpu().tolist()
-                        # derive per-env done flags (terminated OR truncated)
-                        try:
-                            dones_list = (terminated | truncated).detach().cpu().tolist()
-                        except Exception:  # noqa: BLE001
-                            dones_list = [False] * len(mean_costs)
-                        self._semantic_manager.record_multi_step(embeddings, mean_costs, dones_list)
-                    except Exception:  # noqa: BLE001
-                        self._semantic_manager.advance_step()
+                    self._semantic_manager.record_multi_step(embeddings, mean_costs, dones_list)
+                    # removed verbose debug print
                 else:
                     # Legacy single-frame path
                     embedding = None
@@ -115,7 +117,7 @@ class SemanticOnPolicyAdapter(OnPolicyAdapter):  # pragma: no cover minimal logi
                         if embedding is not None:
                             self._embed_success += 1
                             if self._semantic_manager.cfg.shaping_enable:
-                                shaping = self._semantic_manager.shaping_term(embedding)
+                                shaping, _ = self._semantic_manager.compute_shaping_and_eff(embedding)
                         logger.store({
                             'Semantics/Debug/EmbedAttempts': float(self._embed_attempts),
                             'Semantics/Debug/EmbedSuccess': float(self._embed_success),
@@ -135,11 +137,14 @@ class SemanticOnPolicyAdapter(OnPolicyAdapter):  # pragma: no cover minimal logi
                             pass
                         logger.store({'Semantics/ShapingStd': torch.as_tensor(0.0)})
                     # Single-path done if ANY env done this step (approx) for legacy; choose mean done
+                    # Per-env dones list used to count episodes precisely (even in single-frame mode)
                     try:
-                        done_flag = bool(bool(terminated.any()) or bool(truncated.any()))
+                        dones_list = (terminated | truncated).detach().cpu().tolist()
+                        any_done = any(dones_list)
                     except Exception:  # noqa: BLE001
-                        done_flag = False
-                    self._semantic_manager.record_step(embedding, float(cost.mean().item()), done_flag)
+                        dones_list = None
+                        any_done = False
+                    self._semantic_manager.record_step(embedding, float(cost.mean().item()), any_done, env_idx=0)
                     latency = self._semantic_manager.last_embed_latency_ms if embedding is not None else 0.0
                     logger.store({'Semantics/EmbedLatencyMs': latency})
                     logger.store({'Semantics/Shaping': torch.as_tensor(shaping)})
@@ -151,9 +156,22 @@ class SemanticOnPolicyAdapter(OnPolicyAdapter):  # pragma: no cover minimal logi
                     logger.store({'Semantics/EmbedLatencyMs': 0.0})
             if self._semantic_manager.cfg.enable:
                 try:
-                    raw_val = reward.mean() if hasattr(reward, 'mean') else torch.as_tensor(reward)
+                    raw_val = base_reward.mean() if hasattr(base_reward, 'mean') else torch.as_tensor(base_reward)
                     logger.store({'Semantics/RawReward': raw_val})
                 except Exception:  # pragma: no cover
+                    pass
+                # Always log semantic debug metrics (includes Risk/Buf/*) each step to avoid NaNs when no capture.
+                try:
+                    logger.store(self._semantic_manager.debug_metrics())
+                except Exception:  # noqa: BLE001
+                    pass
+                # Live logging of modulation episode counter & active gate status
+                try:
+                    eps_done = float(self._semantic_manager.episodes_completed)
+                    min_eps = float(getattr(self._semantic_manager.cfg, 'modulation_min_episodes', 0))
+                    active = 1.0 if eps_done >= min_eps and getattr(self._semantic_manager.cfg, 'modulation_enable', False) else 0.0
+                    logger.store({'Risk/ModulationActive': active})
+                except Exception:  # noqa: BLE001
                     pass
 
             self._log_value(reward=reward, cost=cost, info=info)
@@ -194,6 +212,20 @@ class SemanticOnPolicyAdapter(OnPolicyAdapter):  # pragma: no cover minimal logi
                         self._log_metrics(logger, idx)
                         self._reset_log(idx)
                     buffer.finish_path(last_value_r, last_value_c, idx)
+            # Centralized explicit episode counting (once per env per true episode end)
+            if self._semantic_manager.cfg.enable:
+                try:
+                    done_mask = (terminated | truncated).detach().cpu()
+                    ended = int(done_mask.int().sum().item())
+                    if ended > 0:
+                        env_indices = [i for i, flag in enumerate(done_mask.tolist()) if flag]
+                        self._semantic_manager.mark_episode_end(int(ended), env_indices=env_indices)
+                        eps_done = float(self._semantic_manager.episodes_completed)
+                        min_eps = float(getattr(self._semantic_manager.cfg, 'modulation_min_episodes', 0))
+                        active = 1.0 if eps_done >= min_eps and getattr(self._semantic_manager.cfg, 'modulation_enable', False) else 0.0
+                        logger.store({'Risk/ModulationActive': active})
+                except Exception:  # noqa: BLE001
+                    pass
 
         if self._semantic_manager.cfg.enable:
             rate = (
