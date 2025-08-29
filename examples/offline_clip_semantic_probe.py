@@ -24,7 +24,7 @@ try:
 except Exception:  # noqa: BLE001
     cv2 = None  # type: ignore
 
-from transformers import CLIPProcessor, CLIPModel
+from transformers import AutoProcessor, AutoModel
 
 
 # -----------------------------
@@ -75,7 +75,7 @@ UNSAFE_PROMPTS: List[str] = [
 # "red car entangled with multiple obstacles"
 # "vehicle wedged against hazard unable to proceed"
 # "dangerous proximity car nearly touching obstacle front"
-MODEL_ID: str = 'openai/clip-vit-base-patch16'
+MODEL_ID: str = "google/siglip2-so400m-patch16-512"
 DEVICE: str = 'cuda' if torch.cuda.is_available() else 'cpu'
 DTYPE: str = 'auto'   # 'auto','bf16','fp16','fp32'
 EVERY_N: int = 1      # sample every Nth frame
@@ -118,14 +118,14 @@ def load_clip(model_id: str, device: str, dtype: str):
         torch_dtype = torch.float16
     elif dtype == 'fp32':
         torch_dtype = torch.float32
-    clip_model = CLIPModel.from_pretrained(model_id, use_safetensors=True)
+    clip_model = AutoModel.from_pretrained(model_id, use_safetensors=True)
     clip_model.to(device)  # type: ignore[call-arg]
     if torch_dtype is not None:
         try:
             clip_model.to(dtype=torch_dtype)  # type: ignore[call-arg]
         except Exception:  # noqa: BLE001
             clip_model = clip_model.to(dtype=torch_dtype)  # type: ignore[call-arg]
-    processor = CLIPProcessor.from_pretrained(model_id)
+    processor = AutoProcessor.from_pretrained(model_id)
     clip_model.eval()
     return clip_model, processor
 

@@ -1,6 +1,6 @@
-# Project Progress & Design Compendium (v1.9)
+# Project Progress & Design Compendium (v2.1)
 
-Comprehensive, self-contained record of the semantic-guided safe RL effort (PPOLagSem) up to document version v1.9.
+Comprehensive, self-contained record of the semantic-guided safe RL effort (PPOLagSem). Snapshot aligned with thesis v2.1.
 
 ---
 ## 1. Objective
@@ -35,6 +35,8 @@ Key success criteria:
 | v1.7 | Potential-based shaping mode | Neutral shaping option | Reduced long-term bias risk |
 | v1.8 | Backward risk target rollout | Lower variance targets | Better correlation early |
 | v1.9 | Episode-aware risk masking + λ modulation | Prevent leakage; adaptive constraint tuning | Lower λ oscillation risk |
+| v2.0 | Risk mini-batch & multi-iter update params (`risk_min_samples`, `risk_batch_size`, `risk_update_iters`) | Flexible auxiliary training schedule | Potentially smoother convergence |
+| v2.1 | AutoModel backend (SigLIP support), NaN/Inf sanitation, float32 risk head, `Risk/NanEvents`, doc consolidation | Flexibility + numerical robustness + observability | Easier model swaps; prevents silent divergence; faster diagnostics |
 
 ---
 ## 4. Semantic Pipeline Data Flow
@@ -66,6 +68,9 @@ Key success criteria:
 | risk_enable | semantic_cfgs | bool | False | Train risk head | Auxiliary representation shaping. |
 | risk_lr | semantic_cfgs | float | 1e-3 | Risk head optimizer LR | Decoupled tuning. |
 | risk_horizon | semantic_cfgs | int | 64 | Truncation length | Balance bias/variance. |
+| risk_min_samples | semantic_cfgs | int | 5 | Minimum samples before training risk head | Avoid noisy early fits. |
+| risk_batch_size | semantic_cfgs | int | 0 | Mini-batch size (0 = full batch) | Controls stochasticity & cost. |
+| risk_update_iters | semantic_cfgs | int | 1 | Risk update iterations per PPO epoch | Extra refinement without larger buffer. |
 | discount | semantic_cfgs | float | 0.99 | Risk target discount | Often aligns with cost discount. |
 | risk_episode_mask_enable | semantic_cfgs | bool | True | Reset accumulation at terminals | Prevent cross-episode leakage. |
 | window_size | semantic_cfgs | int | 2048 | Buffer size for embeddings/costs | Memory/time trade. |
@@ -118,6 +123,8 @@ Potential improvements: EMA smoothing, symmetric up/down scheme, percentile pair
 | Semantics/Beta | Curriculum position | If decays too soon → increase `beta_end_step_fraction`. |
 | Risk/Loss | Aux convergence | Plateau high → adjust `risk_lr` or horizon. |
 | Risk/Corr | Predictive utility | <0.1 after warmup → horizon/prompt mismatch. |
+| Risk/TrainSamples | Samples used in risk update | Low vs buffer size → lower min_samples / increase capture density. |
+| Risk/NanEvents | Sanitized NaN/Inf count | Non-zero growth → inspect dtype transitions, reduce risk_lr. |
 | Risk/ModulationScale | λ lr factor | Stuck extremes → tune percentile/slope/α. |
 | Semantics/EmbedLatencyMs | Embedding cost | Too high → raise capture_interval / reduce batch_max. |
 
@@ -126,20 +133,21 @@ Potential improvements: EMA smoothing, symmetric up/down scheme, percentile pair
 1. λ modulation heuristic unsmoothed (potential jitter).
 2. Risk targets still biased by horizon truncation (no bootstrap tail).
 3. No integration of semantic embeddings into policy/critics (late fusion deferred).
-4. Lack of semantic-specific unit tests (margin sign, beta schedule, risk correlation).
+4. Lack of semantic-specific unit tests (margin sign, beta schedule, risk correlation, NaN path).
 5. Prompt engineering manual; no automated pruning/scoring pipeline yet.
 6. No temporal micro-batching or async capture (may benefit CPU-bound envs).
+7. Modulation one-sided (damping only; no acceleration under low risk).
 
 ---
 ## 10. Remaining High-Level Tasks
 | Priority | Task | Goal | Notes |
 |----------|------|------|-------|
-| P1 | Unit tests suite | Guard correctness & regressions | Focus margin, β schedule, masking, modulation finiteness. |
+| P1 | Unit tests suite | Guard correctness & regressions | Margin sign, β schedule, masking, modulation finiteness, NaN path. |
 | P1 | Config & env snapshot export | Reproducibility | Hash prompts, record torch/transformers versions. |
-| P2 | Modulation smoothing (EMA) | Reduce scale noise | Keep responsiveness via dual-timescale. |
+| P2 | Modulation smoothing (EMA) | Reduce scale noise | Dual-timescale / EMA with bias correction. |
 | P2 | Risk target bootstrap option | Lower bias | Mix with learned cost critic tail. |
-| P2 | Automated prompt scoring | Improve signal quality | Use offline probe stats (margin variance, separation angle). |
-| P3 | Mini-batch risk training | Better convergence | Only if loss plateau persists. |
+| P2 | Automated prompt scoring | Improve signal quality | Offline probe stats (separation angle, variance). |
+| P3 | Distributional risk head | Tail sensitivity | Quantile / CVaR estimates for modulation. |
 | P3 | Temporal micro-batching | Efficiency on low env counts | Buffer frames then batch. |
 | P4 | Embedding-policy fusion | Potential performance lift | Requires arch & obs normalization changes. |
 | P4 | Async embedding worker | Hide latency | Complexity vs marginal gain. |
@@ -172,6 +180,9 @@ Potential improvements: EMA smoothing, symmetric up/down scheme, percentile pair
 | Spatial batching | Stable |
 | Episode masking | Stable |
 | Risk backward targets | Stable |
+| Risk mini-batch loop | Stable |
+| NaN sanitation & metric | Added |
+| AutoModel backend | Stable (CLIP/SigLIP) |
 | λ modulation | Experimental (guarded) |
 | Offline probe | Stable |
 | Unit tests | Pending |
@@ -230,7 +241,7 @@ python examples/train_policy.py \
 
 ---
 ## 18. Document Version
-v1.9 (progress.md snapshot aligned with thesis v1.9)
+v2.1 (progress.md snapshot aligned with thesis v2.1)
 
 ---
 End of progress compendium.

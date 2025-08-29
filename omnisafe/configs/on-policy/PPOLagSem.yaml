@@ -26,7 +26,7 @@ defaults:
     # number of threads for torch (lower when many env processes to avoid oversubscription)
     torch_threads: 1
     # number of vectorized environments
-    vector_env_nums: 1
+    vector_env_nums: 32
     # number of parallel agents (A3C-style); keep 1 unless multi-agent replication implemented
     parallel: 1
     # total number of steps to train
@@ -43,9 +43,9 @@ defaults:
     # entropy bonus coefficient
     entropy_coef: 0.0
     # normalize reward signal
-    reward_normalize: False
+    reward_normalize: True
     # normalize cost signal
-    cost_normalize: False
+    cost_normalize: True
     # normalize observations
     obs_normalize: True
     # stop updating early if KL > target_kl
@@ -80,7 +80,7 @@ defaults:
     use_cost: True
   logger_cfgs:
     # use wandb for logging
-    use_wandb: False
+    use_wandb: True
     # wandb project name
     wandb_project: omnisafe
     # use tensorboard for logging
@@ -145,7 +145,7 @@ defaults:
     model_name: "google/siglip2-so400m-patch16-512"
     # device on which the (frozen) vision-language model runs. Use a GPU (cuda:0) for large capture frequency or many envs.
       # If GPU not available it falls back to CPU automatically (status logged internally).
-    model_device: cpu
+    model_device: cuda:0
     # device where semantic centroids, pooled embeddings, and risk buffers live. Keeping this on CPU saves VRAM
     # at the cost of extra host<->device transfers if the risk head is on GPU. Set to same GPU as model for
     # maximum throughput when memory allows.

@@ -1,3 +1,172 @@
+# PPOLagSem: Semantic & Risk-Augmented Safe Reinforcement Learning (v2.1)
+
+## 1. Executive Summary
+PPOLagSem extends PPO-Lagrangian with frozen vision–language semantic priors and an auxiliary discounted cost ("risk") predictor to accelerate safe policy learning while preserving asymptotic optimality. Since initial integration we: (a) generalized the backend from CLIP-only to any HuggingFace vision–language model (e.g. SigLIP2) via `AutoModel/AutoProcessor`, (b) introduced a configurable risk mini-batch schedule (`risk_min_samples`, `risk_batch_size`, `risk_update_iters`), (c) added robust episode-aware target masking and NaN/Inf sanitation, (d) instrumented comprehensive telemetry (including `Risk/NanEvents`, `Risk/TrainSamples`), and (e) hardened shaping neutrality with potential-based formulation and cosine annealing. All semantic features remain strictly opt-in (`enable=False` → exact PPO-Lag parity).
+
+## 2. Motivation & Design Principles
+Challenges in baseline safe RL: slow emergence of high-level visual abstractions, noisy constraint satisfaction, limited early guidance in sparse/ambiguous scenes. Pretrained vision–language encoders already encode rich relational structure (safe path vs obstacle cluster). Injecting this structure early can (1) bias exploration toward safer progress states, (2) provide an auxiliary supervised-like signal (future discounted cost) to stabilize representations, and (3) enable adaptive constraint tuning via distributional risk statistics.
+
+Guiding principles:
+1. Parity First: Disabled semantics produce identical execution & metrics as PPO-Lagrangian.
+2. Early Help, Eventual Neutrality: Shaping coefficient anneals to zero; potential-based variant ensures telescoping cancellation.
+3. Encapsulation: All semantic logic in `SemanticManager`; PPO core untouched.
+4. Fail-Soft: Any semantic failure (load, OOM) degrades gracefully without aborting training.
+5. Observability: Every emitted semantic/risk scalar is pre-registered and documented; anomalies surfaced via dedicated keys.
+
+## 3. High-Level Architecture
+```
+Env Frames ──► SemanticManager ──► (Embedding, Margin, Shaping) ──► Reward Shaping
+                              └─► (Embeddings, Costs, Dones) ──► Risk Head Training ──► Modulation Stats
+Policy/Value Nets (PPO-Lag)  ◄─────────────────────────────────────────────────────────┘
+```
+Key modules:
+- SemanticManager: model load (CLIP/SigLIP), prompt centroid embedding, temporal pooling, margin normalization, shaping schedule, buffers.
+- Risk Head (SemanticRiskHead): small MLP predicting truncated, episode-masked discounted cost horizon.
+- Modulation (optional): logistic gate on Lagrange multiplier learning-rate based on mean vs percentile gap of recent risk predictions (episode-count gate + safety clamps).
+
+## 4. Recent Change Log (Aug 2025 Cycle)
+| Change | Why | Improvement Mechanism |
+|--------|-----|-----------------------|
+| AutoModel/AutoProcessor backend (CLIP→CLIP+SigLIP) | Flexibility, future models | Swap model by name; status tagging distinguishes family |
+| Risk mini-batch scheduling (`risk_min_samples`, `risk_batch_size`, `risk_update_iters`) | Data sufficiency & stability | Avoid underfit on tiny sample sets, allow stochastic regularization |
+| Episode-aware target masking (`risk_episode_mask_enable`) | Prevent post-terminal leakage | Cleaner cost-to-go signal, higher early correlation |
+| NaN / Inf sanitation + float32 risk head + `Risk/NanEvents` | Robustness under mixed precision | Eliminates silent divergence; diagnostics for instability |
+| `Risk/TrainSamples` metric | Audit effective sample usage | Confirms scheduling parameters impact |
+| Potential-based shaping (`potential_enable`) | Bias elimination | As training progresses shaping telescopes to zero net effect |
+| Temporal embedding pooling (`temporal_window`) | Reduce per-frame semantic noise | Smoother margins; fewer clamp events |
+| Margin normalization toggle + scaling (`margin_norm_enable`, `margin_scale`) | Controlled ablations | Identify whether normalization suppresses informative variance |
+| Modulation episode-count gate (`modulation_min_episodes`) | Defer adaptive scaling until stable | Reduces early oscillations in λ dynamics |
+| Risk LR configurability (`risk_lr`) | Independent convergence control | Align auxiliary optimization speed with horizon |
+| Logging expansion (Raw/Nominal Margins, ClampFrac, CaptureIntervalEffective) | Interpretability | Rapid root cause isolation for weak shaping |
+| SigLIP example config comments in YAML | Discoverability | Lowers barrier to model substitution |
+
+## 5. Algorithmic Components
+### 5.1 Semantic Margin & Shaping
+Prompts: sets of safe and unsafe natural language descriptions embedded once to centroids (normalized). Given frame embedding e:
+```
+margin m = cos(e, μ_safe) - cos(e, μ_unsafe)
+normed  ṁ = (m - mean_running)/std_running  (if enabled)
+clipped ĉ = clamp( (ṁ * margin_scale), -2, 2 )
+beta_t  = cosine_anneal(beta_start → 0 over fraction β_end_step_fraction of total steps)
+Additive:  r' = r + beta_t * ĉ
+Potential: r' = r + beta_t * (γ * φ(s') - φ(s)),  φ(s)=ṁ*margin_scale (clamped only inside shaping term)
+```
+Annealing ensures diminishing influence; potential mode guarantees policy invariance as β→0.
+
+### 5.2 Risk Prediction
+Target (episode-masked truncated discounted cost horizon H):
+```
+g_t = Σ_{k=0}^{H-1} (γ_c)^k c_{t+k}  (stop at terminal or horizon)
+Loss: SmoothL1( q_φ(e_t), g_t )
+```
+Multi-iteration mini-batching samples either the full window or random subsets (without replacement where possible) up to `risk_update_iters` times per PPO epoch (guarded by `risk_min_samples`).
+
+### 5.3 Modulation (Optional)
+Given filtered risk predictions {ĝ}: compute percentile q_p and mean μ. Difference Δ = μ - q_p scaled by slope proxy q_p/slope → logistic gate g = σ( clamp(Δ / (q_p/slope+ε), -20, 20) ). Learning-rate scale M = 1 / (1 + α * g). Episode-count gate enforces minimum data maturity; fallback returns 1.0 on anomalies. (Current design is conservative: higher relative risk ⇢ smaller step to avoid overshoot.)
+
+### 5.4 Temporal Pooling
+Maintains per-env deque of last k embeddings (k = `temporal_window`). Effective embedding is the mean (warm-up uses partial). Reduces variance in instantaneous margins without extra encoder calls.
+
+## 6. Data & Dtype Flow
+| Stage | Device | Dtype Strategy |
+|-------|--------|----------------|
+Model Load | model_device | Attempt fp16/bf16 else fp32 (AutoModel) |
+Prompt Centroids | model_device → host_device | Normalize; cast to fp32 if host is CPU |
+Frame Embedding | model_device | Normalize L2; move to host (retaining reduced precision if host GPU) |
+Risk Head | model_device | Always float32 for stability (independent of encoder precision) |
+Targets | risk_device | float32 construction; sanitized (nan_to_num) |
+
+## 7. Logging & Telemetry (Active Keys Additions)
+Semantic: RawMargin, NormMargin, Beta, ClampFrac, CaptureCount, CaptureIntervalEffective, Shaping (min/max/mean), ShapingRewardRatio, ShapingStd, EmbedLatencyMs, EmbedSuccessRate.
+Risk: Loss, PredMean, TargetMean, Corr, TrainSamples, LR, ModulationScale, ModulationActive (implicit via scale & gating), NanEvents, TrainStatusCode/MsgLen, Buf/Embeddings|Costs|Dones.
+Purpose: Provide a closed diagnostic loop: (Signal Quality) margins & normalization –> (Curriculum) beta & shaping ratio –> (Aux Learning) risk statistics –> (Safety Control) modulation response.
+
+## 8. Configuration Surface (Incremental Additions)
+```
+semantic_cfgs:
+  enable: bool
+  model_name: str              # e.g. openai/clip-vit-base-patch16 or google/siglip-so400m-patch14-384
+  model_device / host_device
+  capture_interval: int
+  temporal_window: int
+  shaping_enable: bool
+  potential_enable: bool
+  beta_start, beta_end_step_fraction
+  margin_norm_enable, margin_scale
+  risk_enable: bool
+  risk_lr: float
+  risk_horizon: int
+  discount: float              # for risk targets
+  risk_episode_mask_enable: bool
+  risk_min_samples: int
+  risk_batch_size: int         # 0 = full batch
+  risk_update_iters: int
+  modulation_enable: bool
+  modulation_min_episodes: int
+  alpha_modulation, threshold_percentile, slope
+  window_size, norm_window     # embedding & margin buffers
+  batch_across_envs, batch_max, oom_backoff
+  safe_prompts[], unsafe_prompts[]
+  simple_mode: bool            # simplified load path
+```
+
+## 9. Stability & Robustness Enhancements
+- Float32 risk head regardless of encoder half precision.
+- Sanitization (embeddings, targets, preds) + event counter (`Risk/NanEvents`).
+- Episode-masked target builder eliminates cross-episode contamination.
+- Minimum sample gate prevents premature overfitting on tiny buffers.
+- Conservative modulation defers adaptation until adequate episodes collected.
+
+## 10. Performance Considerations
+Levers: `capture_interval`, spatial batching (`batch_across_envs`), temporal pooling (`temporal_window`), mixed precision encoder, limiting `risk_update_iters` & `risk_batch_size` for auxiliary cost. Telemetry `EmbedLatencyMs` and `CaptureCount` quantify overhead. SigLIP variants allow trade-offs (resolution vs capacity).
+
+## 11. Empirical Improvement Mechanisms (Qualitative)
+| Mechanism | Expected Benefit | Underlying Reason |
+|-----------|------------------|-------------------|
+Early semantic shaping | Faster return & safer exploration | Inject prior separating safe/unsafe scene factors |
+Risk auxiliary loss | Lower policy variance, better constraint stability | Embedding aligns with future cost structure |
+Mini-batch risk schedule | Smoother convergence of risk head | Reduces gradient variance & catastrophic updates |
+Episode masking | Higher risk-target fidelity | Removes spurious discounted tails across resets |
+Temporal pooling | Reduced shaping noise | Averages transient frame perturbations |
+Modulation gate | Reduced λ oscillations | Dampened adaptation under noisy early risk estimates |
+Backend generalization | Future-proof semantic signal | Swap-in improved encoders (SigLIP) without refactor |
+NaN guards | Prevent silent training corruption | Forces recoverable defaults & logging |
+
+## 12. Evaluation Plan
+Primary: Steps-to-threshold return, average cost vs limit, late-phase cost variance, overhead (steps/sec). Secondary: risk Loss, Risk/Corr, shaping influence ratio decay, modulation scale trajectory. Each ablation (shaping only, risk only, both, +potential) across ≥3 seeds; report mean ± 95% CI.
+
+## 13. Limitations
+- Frozen visual encoder may lack domain-specific granularity (prompt engineering required).
+- Modulation presently conservative-only (no acceleration under high risk) and unsmoothed.
+- Risk targets truncated; no bootstrap of beyond-horizon tail.
+- Semantic shaping frequency uniform; no adaptive scheduling to variability or uncertainty yet.
+
+## 14. Forward Work (Prioritized)
+1. Adaptive capture interval (variance / latency budget based).
+2. Distributional risk head (quantiles or CVaR) for tail-sensitive modulation.
+3. Prompt set auto-refinement (impact scoring, evolutionary selection).
+4. Smoothing / EMA for modulation scale; correlation quality gating.
+5. Counterfactual semantic shaping (predict safe alternative future embedding).
+6. Lightweight online distillation: large encoder sporadically teacher-forces smaller fast encoder.
+7. Optional policy late-fusion with low-rank embedding projection (after stability benchmarks).
+
+## 15. Key Equations
+Reward shaping (additive): `r'_t = r_t + β_t * clamp( (m_t−μ)/σ * margin_scale, -2, 2 )`
+Potential shaping: `r'_t = r_t + β_t (γ φ_{t+1} − φ_t)`
+Risk target: `g_t = Σ_{k=0}^{H-1} (γ_c)^k c_{t+k}` (stop at terminal)
+Risk loss: `L_risk = SmoothL1(q_φ(e_t), g_t)`
+Modulation scale: `M = 1 / (1 + α * σ( clamp( (μ−q_p)/(q_p/slope+ε), -20, 20) ))`
+
+## 16. Version History (Condensed)
+| Version | Date | Highlights |
+|---------|------|-----------|
+| v1.x (baseline series) | Earlier | Initial semantic shaping, risk head, batching, potential shaping |
+| v2.0 | 2025-08-21 | Risk mini-batch scheduling params & logging (`risk_min_samples`, `risk_batch_size`, `risk_update_iters`, `Risk/TrainSamples`) |
+| v2.1 | 2025-08-23 | AutoModel backend (SigLIP support), NaN-safe risk loop (`Risk/NanEvents`), float32 risk head, documentation rewrite |
+
+---
+This document supersedes earlier exhaustive narrative (v1.x deep dive); obsolete implementation details (e.g., single-frame only capture, CLIP-only loader) removed for clarity. Historical artifacts retained in repository history if needed.
+
 # Semantic-Guided Safe RL Extension (PPOLagSem)
 
 ## 1. Overview
@@ -90,16 +259,86 @@ $$
 $$
 Only $\theta$ receives gradients through policy surrogate; $\phi$ through risk head; encoder frozen.
 
-#### 4.0.5 Lagrange Modulation (Initial Implementation)
-Let empirical distribution of recent predicted (episode-aware) truncated discounted costs be $Q$. For chosen upper quantile $q_{\alpha}$ and median $q_{med}$ define
+#### 4.0.5 Lagrange Modulation (Current Implementation)
+Goal: adapt the *effective* learning rate of the Lagrange multiplier so that constraint responsiveness increases when predicted future costs are high relative to typical values, and decreases (damping) when predicted risk is uniformly low. The modulation multiplies the base λ optimizer learning rate; it never changes the analytic update rule itself.
+
+Let $\hat g_i$ be recent risk head predictions (truncated, episode-aware discounted cost targets) collected in the semantic window buffer. Define:
+* Percentile level: $p = \texttt{threshold\_percentile} / 100$ (e.g. 0.60 for 60th percentile).
+* Empirical percentile: $q_p = \operatorname{Quantile}_p(\{\hat g_i\})$.
+* Mean prediction: $\bar g = \frac{1}{N}\sum_i \hat g_i$ over finite (non-NaN) predictions.
+
+We form a *contrast* $\Delta = \bar g - q_p$ capturing the gap between central tendency and tail. Rather than using a raw temperature, we scale by a *data-driven slope proxy* derived from the percentile itself:
 $$
-z_t = \frac{ q_{\alpha}(Q) - q_{med}(Q)}{\tau},
+ s = \max\Big(\frac{q_p}{\texttt{slope}},\; \epsilon\Big), \quad \epsilon=10^{-6}.
 $$
-with temperature $\tau>0$. A logistic squashing yields
+Intuition: when absolute risk magnitudes shrink, we avoid amplifying noise by keeping the normalized argument bounded.
+
+Normalized argument:
 $$
-\eta_t = \sigma(z_t)=\frac{1}{1+e^{-z_t}}.
+ a = \operatorname{clip}\Big( \frac{\Delta}{s}, -A, A \Big), \quad A=20.
 $$
-Implementation: we modulate the effective learning rate of the Lagrange multiplier optimizer each PPO update: $\text{lr}_\lambda^{eff} = \eta_t \cdot \text{lr}_\lambda$. High tail risk (large quantile gap) accelerates λ adaptation; low risk dampens oscillations. Logged as `Risk/ModulationScale`.
+Logistic gate:
+$$
+ g = \sigma(a) = \frac{1}{1+e^{-a}}.
+$$
+Final modulation scale (what *multiplies* the base λ learning rate):
+$$
+ M = \frac{1}{1 + \alpha \cdot g}, \qquad \alpha=\texttt{alpha\_modulation}.
+$$
+Thus $M \in (0,1]$; larger gate $g$ (higher relative tail risk) yields *smaller* scale (damping) — chosen to reduce overshoot when risk looks elevated; this is effectively conservative modulation. (If one wanted *accelerated* adaptation under high risk, we would instead define $M=1+\alpha g$; current conservative form matches the implemented code.)
+
+Implementation Notes:
+1. Non-finite predictions are filtered before statistics.
+2. Minimum sample requirement ($\ge 10$ finite predictions) guards against early noise.
+3. All intermediate tensors are clamped to avoid Inf/NaN logistic inputs.
+4. Fallback path returns scale $M=1.0$ on *any* anomaly (insufficient data, exceptions, non-finite stats).
+
+Logged Telemetry:
+* `Risk/ModulationScale` → $M$.
+* `Risk/ModulationActive` → binary indicator (1 when gating condition satisfied, else 0).
+
+##### 4.0.5.1 Episode-Count Gating
+Empirical issue: very early risk head predictions are high variance and can produce spurious modulation. A *hard episode-count gate* defers modulation until at least `modulation_min_episodes` complete episodes have been observed (default 10). While gated:
+$$
+ M = 1.0 \quad \text{(no modulation; baseline λ dynamics)}.
+$$
+Only when `episodes_completed \ge modulation_min_episodes` do we compute the logistic scale above. This simple structural prior avoids reliance on unstable early correlation metrics.
+
+Planned Extensions (not yet implemented):
+* Quality gate using minimum Pearson correlation between predictions and targets (e.g. `>= corr_min`).
+* Exponential Moving Average (EMA) smoothing: $M_{ema} = (1-\beta) M_{prev} + \beta M_{raw}$ with drift guard to reduce jitter.
+* Per-environment gating once risk buffers track per-env predictions.
+
+##### 4.0.5.2 Design Rationale
+| Concern | Mitigation in Current Design |
+|---------|------------------------------|
+| Early high variance | Episode-count gating (hard off switch) |
+| Noisy tails / outliers | Percentile vs max; finite mask filtering |
+| Scale explosion | Logistic with argument clamp ±20 |
+| Vanishing denominator | Percentile-based slope proxy with $\epsilon$ floor |
+| NaNs / Infs | Immediate fallback to 1.0 scale |
+
+##### 4.0.5.3 Pseudocode
+```
+if not (modulation_enable and risk_head and enough_embeddings):
+  return None  # semantics disabled or no data
+if episodes_completed < modulation_min_episodes:
+  return 1.0
+preds = risk_head(emb_stack).flatten()
+preds = preds[isfinite(preds)]
+if len(preds) < 10: return 1.0
+q = quantile(preds, threshold_percentile/100)
+mean = preds.mean()
+if not finite(q, mean): return 1.0
+slope_scale = q / slope if |q| > tiny else 1.0
+arg = clamp( (mean - q) / (slope_scale + 1e-6), -20, 20 )
+gate = sigmoid(arg)
+scale = 1.0 / (1.0 + alpha_modulation * gate)
+return scale if finite(scale) else 1.0
+```
+
+##### 4.0.5.4 Contrast With Earlier Text Formulation
+Earlier drafts described accelerating λ updates with higher tail risk (multiplicative >1). The *implemented* variant instead dampens step size under elevated predicted risk to reduce overshoot and oscillation. Updating theoretical framing accordingly prevents divergence between doc and code.
 
 #### 4.0.6 Convergence Considerations
 Because shaping vanishes ($\beta_t \to 0$) and auxiliary loss does not alter the final reward signal, fixed points coincide with those of PPO-Lagrange (assuming perfect critics). Auxiliary risk training influences representation quality and early policy gradients but not terminal optimality.
@@ -608,10 +847,11 @@ python examples/train_policy.py --algo PPOLagSem --env-id SafetyCarGoal1-v0 --se
 | v1.3 | 2025-08-18 | Runtime behavior clarifications, batching design, config troubleshooting, roadmap re-prioritized |
 | v1.4 | 2025-08-19 | Executive technical summary, parity pseudocode, clarified risk head training phase |
 | v1.5 | 2025-08-19 | Spatial batching (per-env embeddings & shaping), batch OOM backoff, capture count telemetry |
+| v2.0 | 2025-08-21 | Risk mini-batch training params (`risk_min_samples`, `risk_batch_size`, `risk_update_iters`), TrainSamples logging, episode masking stabilized |
 | v1.6 | 2025-08-19 | Telemetry expansion (RawMargin/NormMargin/Beta/ClampFrac/CaptureIntervalEffective), config additions (risk_lr, margin_norm_enable, margin_scale), removal of obsolete ClipReady/ClipStatus, CSV semantic analysis script |
 | v1.7 | 2025-08-19 | Potential-based shaping implementation (`potential_enable`), shaping influence metrics (ShapingRewardRatio, ShapingStd), documentation of additive vs potential formulation, neutrality rationale |
 | v1.8 | 2025-08-19 | Risk head backward (reverse) discounted target rollout implemented; clarified target construction; offline semantic probe & prompt engineering workflow documented; roadmap/status updated (risk target refinement DONE) |
-| v1.9 | 2025-08-20 | Episode-aware risk target masking; initial Lagrange modulation (lr scaling); log key `Risk/ModulationScale`; config flag `risk_episode_mask_enable` |
+| v1.9 | 2025-08-20 | Episode-aware risk target masking; initial Lagrange modulation (lr scaling); log key `Risk/ModulationScale`; config flag `risk_episode_mask_enable`; added simple episode-count gating (`modulation_min_episodes`) with telemetry `Risk/ModulationActive` |
 
 ### 24.1 Active Feature Matrix
 | Feature | Status | Config Flag(s) | Notes |
@@ -622,7 +862,7 @@ python examples/train_policy.py --algo PPOLagSem --env-id SafetyCarGoal1-v0 --se
 | Risk head auxiliary loss | Stable | `risk_enable`, `risk_horizon`, `discount`, `risk_lr` | Single batch update post PPO |
 | Backward risk target rollout | Stable | (implicit) | Reverse pass + forward clamp |
 | Episode-aware masking | Stable | `risk_episode_mask_enable` | Prevents cross-episode leakage |
-| Lagrange modulation (lr scaling) | Experimental | `modulation_enable`, `threshold_percentile`, `alpha_modulation`, `slope` | Logistic quantile gap (no smoothing) |
+| Lagrange modulation (lr scaling) | Experimental | `modulation_enable`, `modulation_min_episodes`, `threshold_percentile`, `alpha_modulation`, `slope` | Logistic quantile gap with episode-count gating (no smoothing/correlation gating yet) |
 | Offline semantic probe | Stable | (script) | Prompt separability diagnostics |
 | Target bootstrap tail | Planned | — | Potential bias reduction |
 | Modulation smoothing (EMA) | Planned | — | Reduce scale volatility |
@@ -744,6 +984,29 @@ Given recent instantaneous costs sequence `c[0:L]` (aligned with collected embed
 2. For indices where full horizon not covered (i close to sequence start) optionally recompute a forward truncated sum to strictly enforce horizon cap, matching implementation detail in `policy_gradient.py`.
 3. If `H < L`, forward refinement loop ensures each `t[i]` only includes up to `H` discounted terms, preventing overestimation in very long buffers.
 
+#### 29.2.1 Episode-Aware Masking
+When `risk_episode_mask_enable=True`, terminal flags (`done` events) reset the backward accumulator:
+```
+running = 0
+look = 0
+for i in reversed(range(L)):
+  if done[i]:
+    running = 0; look = 0  # hard reset at episode boundary
+  if look >= H:
+    running = 0; look = 0  # horizon truncation reset
+  running = c[i] + gamma_c * running
+  t[i] = running
+  look += 1
+```
+This guarantees no discounted leakage of post-terminal costs into prior episodes, aligning targets with episodic safety semantics. The subsequent forward refinement respects both horizon and episode stops (breaking accumulation when a `done[j]` is encountered).
+
+Edge Cases & Guards:
+* If `dones` deque shorter than costs (legacy entries), it is left-padded with False to maintain alignment.
+* Empty buffers → return `None` (risk update skipped, logs zero loss).
+* Horizon `H=0` degenerately yields all-zero targets; configuration prevents this in practice (validated ≥1).
+
+Complexity: $O(L)$ backward + $O(\min(L,H) L)$ forward refinement (practically limited by modest window sizes). For typical window sizes (≤2048, H=64) overhead is negligible relative to CLIP forward passes.
+
 ### 29.3 Implementation Notes
 * Executed inside `_update()` after PPO actor/critic updates (keeps auxiliary gradient step segregated).
 * Operates on most recent window (`L` limited implicitly by deque length and embedding availability).
@@ -789,6 +1052,43 @@ An external diagnostic script (`examples/offline_clip_semantic_probe.py`) accele
 
 ### 30.5 Rationale for External Probe
 Keeps RL training loop lean; enables rapid semantic hypothesis testing (prompt wording, visual anchor selection) offline, de-risking integration changes.
+
+## 33. Temporal Embedding Pooling (Mean Window) – Implementation Note
+
+### 33.1 Motivation
+Per-frame semantic margins can exhibit high variance due to transient visual artifacts (camera jitter, rapidly changing distractors). A lightweight temporal smoothing reduces this noise, potentially stabilizing early shaping without introducing significant delay or bias.
+
+### 33.2 Current Mechanism
+Config key: `temporal_window` (default 1 = disabled). When set to k>1 the `SemanticManager` maintains a deque of the last k frame embeddings (episode boundary clears it). On each capture:
+1. Append current embedding (detached) to deque.
+2. Effective embedding `e_eff = mean(embeddings_in_window)` (warm-up: mean over <k available embeddings).
+3. Margin & shaping computed from `e_eff` (potential-based shaping uses resulting potential value likewise).
+
+### 33.3 Properties
+* Zero additional CLIP calls (smoothing done post-embedding).
+* Warm-up behavior ensures no scale discontinuity early (progressive fill).
+* Episode reset prevents semantic leakage across episodes.
+* Metric: `Semantics/TemporalWindowFill` reports fill ratio = current_len / k (0 when disabled or k=1).
+
+### 33.4 Rationale for Simple Mean vs Alternatives
+| Alternative | Pros | Cons | Deferred Reason |
+|-------------|------|------|-----------------|
+| Exponential Moving Average | Continuous weighting, O(1) memory | Implicit time constant; harder to interpret window length | Mean window is more transparent & bounded |
+| Attention over last k | Adaptive focus | Additional parameters & training signal needed | Premature complexity without evidence of need |
+| Median / trimmed mean | Robust to outliers | Higher compute per step (sort) | Outlier rate presently low |
+
+### 33.5 Future Extensions
+1. Optional EMA variant (`temporal_window_mode: ema`) with beta derived from k.
+2. Variance-based adaptive k (increase window if margin variance high).
+3. Dual stream: keep both latest and pooled embeddings for risk head concatenation.
+
+### 33.6 Empirical Evaluation Plan
+Run A/B: `temporal_window ∈ {1,4,8}` under shaping-only configuration; compare:
+* Early (first 5% steps) shaping reward variance.
+* Time-to-threshold episodic return.
+* Final cost constraint adherence variance.
+If mean window reduces shaping variance >20% with ≤5% slowdown in convergence, retain; else revert to 1.
+
 
 ## 31. Roadmap Status Update (Post v1.8)
 
