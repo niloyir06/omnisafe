@@ -1,7 +1,35 @@
 # PPOLagSem: Semantic & Risk-Augmented Safe Reinforcement Learning (v2.1)
 
+## 0. Thesis Structure (Paper Outline)
+- Chapter 1: Introduction — problem motivation, safe RL challenges, opportunity of pretrained VLMs, high-level idea, numbered contributions, and chapter roadmap.
+- Chapter 2: Background Theory & Literature — RL/MDP recap, PPO and PPO‑Lagrangian, reward shaping theory (potential vs additive), auxiliary prediction in RL, VLM basics (CLIP/SigLIP), notation, and positioning among related work.
+- Chapter 3: Methodology — system overview, SemanticManager, margin processing and shaping (additive/potential with β schedule), auxiliary risk targets and training, Lagrange modulation, precision/devices, logging/telemetry, complexity and failure modes.
+- Chapter 4: Results & Discussion — environments and constraints, baselines (PPO, TRPO, TRPOLag, CPO, P3O, CPPOPID, PPOSaute, PPOSimmerPID) and ablations, metrics and statistics, parity with semantics disabled, early sample‑efficiency gains, modulation impact, risk head effectiveness, overhead profile, robustness and prompt sensitivity, summary table, and discussion.
+- Chapter 5: Conclusion & Future Work — summary of findings, limitations, future directions (distributional risk, adaptive schedules, prompt optimization, fusion/distillation).
+
 ## 1. Executive Summary
 PPOLagSem extends PPO-Lagrangian with frozen vision–language semantic priors and an auxiliary discounted cost ("risk") predictor to accelerate safe policy learning while preserving asymptotic optimality. Since initial integration we: (a) generalized the backend from CLIP-only to any HuggingFace vision–language model (e.g. SigLIP2) via `AutoModel/AutoProcessor`, (b) introduced a configurable risk mini-batch schedule (`risk_min_samples`, `risk_batch_size`, `risk_update_iters`), (c) added robust episode-aware target masking and NaN/Inf sanitation, (d) instrumented comprehensive telemetry (including `Risk/NanEvents`, `Risk/TrainSamples`), and (e) hardened shaping neutrality with potential-based formulation and cosine annealing. All semantic features remain strictly opt-in (`enable=False` → exact PPO-Lag parity).
+
+## Scope Status: Implemented vs Pending
+Implemented (done):
+- Semantic shaping: additive and potential-based with cosine-annealed β, running z-normalization, clamp, and neutrality telemetry (ShapingRewardRatio, ShapingStd).
+- Architecture: `SemanticManager` + `SemanticOnPolicyAdapter` injection; PPO core untouched; strict parity when disabled.
+- VLM backend: CLIP generalized to HuggingFace AutoModel/AutoProcessor (e.g., SigLIP), safetensors, dtype fallback chain (bf16→fp16→fp32).
+- Performance controls: `capture_interval`, temporal pooling, spatial batching across envs with OOM backoff.
+- Risk head: truncated discounted horizon with episode-aware masking; backward (reverse) rollout; SmoothL1 loss; configurable mini-batch schedule (`risk_min_samples`, `risk_batch_size`, `risk_update_iters`); float32 head and dtype alignment.
+- Telemetry & robustness: Semantics/* and Risk/* metrics, device/dtype status, NaN/Inf sanitation, fail-soft guards.
+- Modulation: initial LR scaling of Lagrange updates via risk-quantile logistic gate with episode-count gating (experimental) and `Risk/ModulationScale` logging.
+- Tooling: offline semantic probe for prompt/centroid analysis and annotated videos.
+
+Pending (not done or experimental):
+- Results packaging: final figures/tables (parity overlap, early AUC gains, overhead breakdown) and scripted regeneration from logs.
+- Modulation refinements: EMA smoothing, correlation-quality gating, optional acceleration variant, and per-env gating.
+- Adaptive scheduling: auto-tuned `capture_interval` and β schedule based on latency/utility.
+- Prompt automation: prompt set optimization/curriculum; uncertainty/confidence gating as a default policy.
+- Risk head upgrades: distributional (quantile/CVaR) outputs; integrated calibration layer with ECE/reliability in training (beyond analysis-only).
+- Policy fusion & deployment: feature fusion into policy; student distillation to eliminate online VLM usage for real-time control.
+- Testing & reproducibility: expanded unit tests (margin normalization/clip, beta endpoints, dtype fallback, batching parity, risk target correctness/correlation); full config/version snapshotting and prompt hashing in artifacts.
+- Performance engineering: async embedding worker, temporal micro-batching (if profiling justifies), cross-process semantic stat synchronization.
 
 ## 2. Motivation & Design Principles
 Challenges in baseline safe RL: slow emergence of high-level visual abstractions, noisy constraint satisfaction, limited early guidance in sparse/ambiguous scenes. Pretrained vision–language encoders already encode rich relational structure (safe path vs obstacle cluster). Injecting this structure early can (1) bias exploration toward safer progress states, (2) provide an auxiliary supervised-like signal (future discounted cost) to stabilize representations, and (3) enable adaptive constraint tuning via distributional risk statistics.
@@ -12,6 +40,60 @@ Guiding principles:
 3. Encapsulation: All semantic logic in `SemanticManager`; PPO core untouched.
 4. Fail-Soft: Any semantic failure (load, OOM) degrades gracefully without aborting training.
 5. Observability: Every emitted semantic/risk scalar is pre-registered and documented; anomalies surfaced via dedicated keys.
+
+### Research Hypothesis
+Foundational vision–language models encode broad world knowledge and visually grounded safety cues from large‑scale training. By distilling this semantic prior into auxiliary signals (annealed shaping and a short‑horizon discounted cost predictor), an RL agent can acquire a functional notion of safety faster and with fewer violations than using environment feedback alone. Because VLM inference is expensive and unsuitable for high‑rate control, we amortize its use offline and sparsely online (interval capture, batching, and eventual student/distilled models) so the deployed policy operates in real time without the VLM.
+
+## 2A. Background: RL Algorithms Under Test (Chapter 2 content)
+This section summarizes the baseline algorithms evaluated alongside PPOLagSem; it maps to the Background chapter of the thesis.
+
+### PPO (Unconstrained)
+- Objective: clipped surrogate with entropy, no safety constraint.
+- Maximize L_PPO(θ) = E[min(r_t(θ)Â_r,t, clip(r_t,1−ε,1+ε)Â_r,t)] + α E[H(π_θ)].
+
+### TRPO (Unconstrained Trust Region)
+- Objective: maximize E[r_t(θ)Â_r,t] subject to E[KL(π_{θ_old} || π_θ)] ≤ δ (second-order step via conjugate gradient + line search).
+
+### PPO‑Lagrangian (PPOLag)
+- Safety mechanism: Lagrangian penalty using cost advantage Â_c,t (or mean cost).
+- Maximize L_PPO(θ) − λ E[Â_c,t], λ ≥ 0; update λ ← [λ + η_λ (J_c − d)]_+.
+
+### TRPO‑Lagrangian (TRPOLag)
+- TRPO trust‑region step with Lagrangian penalty on cost (as above) while keeping KL ≤ δ.
+
+### CPO (Constrained Policy Optimization)
+- Safety mechanism: solves a local constrained problem each update: maximize reward surrogate s.t. cost surrogate ≤ d and KL ≤ δ.
+- Practical implementation: QP with linearized constraints; ensures monotone improvement under approximations.
+
+### P3O (Primal–Dual PPO Variant)
+- Safety mechanism: explicit primal–dual updates coupling policy step with dual variable dynamics; close to PPOLag but with tailored update rules/penalties.
+
+### CPPOPID (PID Lagrange Controller)
+- Safety mechanism: PID control of λ with error e_t = (J_c − d):
+- λ_{t+1} = [λ_t + K_p e_t + K_i ∑_{τ≤t} e_τ + K_d (e_t − e_{t−1})]_+ (tunable K_p,K_i,K_d).
+
+### PPOSaute (Budget‑Augmented Safe RL)
+- Safety mechanism: augment state with remaining budget b; dynamics b_{t+1} = b_t − c_t; policy conditions on (s,b) to respect a safety budget (Sauté RL formulation).
+
+### PPOSimmerPID (Simmer‑Style PID Safety Controller)
+- Safety mechanism: PID‑regulated safety pressure that “simmers” the effective budget/penalty over training, aiming for smoother constraint satisfaction than pure gradient ascent.
+
+### Comparison Summary
+| Algorithm | Safety Mechanism | Constraint Handling | Notes |
+|-----------|------------------|---------------------|-------|
+| PPO | None | — | Return‑only baseline |
+| TRPO | None (trust region) | KL ≤ δ | Unconstrained trust‑region |
+| PPOLag | Lagrangian | Dual ascent on λ | Clip surrogate + cost advantage |
+| TRPOLag | Lagrangian + TRPO | Dual ascent + KL ≤ δ | Trust‑region variant of PPOLag |
+| CPO | Constrained optimization | Surrogate cost ≤ d, KL ≤ δ | QP step; safety‑first |
+| P3O | Primal–dual | Dual variable dynamics | Variant of constrained PPO |
+| CPPOPID | PID‑controlled λ | PID on cost error | Tunable responsiveness |
+| PPOSaute | Budget augmentation | State includes budget | Budget dynamics b_{t+1}=b_t−c_t |
+| PPOSimmerPID | PID safety controller | PID schedule | Smooth constraint tracking |
+
+Suggested visuals for Chapter 2:
+- Fig. C2‑1: Schematic of constraint handling families (Lagrangian, trust‑region, constrained line‑search, PID, budget augmentation).
+- Table C2‑1: The above comparison table with hyperparameter knobs per method.
 
 ## 3. High-Level Architecture
 ```
@@ -53,6 +135,8 @@ Potential: r' = r + beta_t * (γ * φ(s') - φ(s)),  φ(s)=ṁ*margin_scale (cla
 ```
 Annealing ensures diminishing influence; potential mode guarantees policy invariance as β→0.
 
+Optional uncertainty gating: gate shaping by a confidence score (e.g., prompt‑ensemble variance or margin temperature sweep). If confidence < τ, set shaping to 0 for that step; log gating rate for attribution.
+
 ### 5.2 Risk Prediction
 Target (episode-masked truncated discounted cost horizon H):
 ```
@@ -61,11 +145,52 @@ Loss: SmoothL1( q_φ(e_t), g_t )
 ```
 Multi-iteration mini-batching samples either the full window or random subsets (without replacement where possible) up to `risk_update_iters` times per PPO epoch (guarded by `risk_min_samples`).
 
+Calibration (optional): fit a monotonic calibration layer (Platt scaling or isotonic) on a held‑out slice of rollouts mapping raw q_φ to empirical g_t; report expected calibration error (ECE) and reliability curves.
+
 ### 5.3 Modulation (Optional)
 Given filtered risk predictions {ĝ}: compute percentile q_p and mean μ. Difference Δ = μ - q_p scaled by slope proxy q_p/slope → logistic gate g = σ( clamp(Δ / (q_p/slope+ε), -20, 20) ). Learning-rate scale M = 1 / (1 + α * g). Episode-count gate enforces minimum data maturity; fallback returns 1.0 on anomalies. (Current design is conservative: higher relative risk ⇢ smaller step to avoid overshoot.)
 
 ### 5.4 Temporal Pooling
 Maintains per-env deque of last k embeddings (k = `temporal_window`). Effective embedding is the mean (warm-up uses partial). Reduces variance in instantaneous margins without extra encoder calls.
+
+### 5.5 PPO‑Lagrangian Training Loop (Pseudo‑code)
+```
+Inputs:
+  Policy π_θ, reward critic V_ψ, (optional) cost critic V^c_ξ,
+  cost limit d, clip ε, entropy coef α, discounts γ, γ_c,
+  GAE λ_gae, λ_gae_c, PPO epochs K, batch size B, λ step η_λ.
+Initialize: λ ← λ_0 ≥ 0.
+
+repeat (iterations)
+  # 1) Rollout collection
+  D ← {(s_t, a_t, r_t, c_t, logp_old_t, s_{t+1}, done_t)} from π_θ.
+
+  # 2) Advantage computation (reward & cost)
+  Ĝ_r,t, Â_r,t ← GAE(r_t, V_ψ; γ, λ_gae) per trajectory.
+  Ĝ_c,t, Â_c,t ← GAE(c_t, V^c_ξ; γ_c, λ_gae_c) or MC if no cost critic.
+  Normalize Â_r,t (and optionally Â_c,t).
+
+  # 3) PPO optimization (K epochs)
+  for epoch = 1..K:
+    for minibatch M ⊂ D of size B:
+      r_t(θ) ← exp(log π_θ(a_t|s_t) − logp_old_t)
+      L_clip ← E_M[min(r_t · Â_r,t, clip(r_t,1−ε,1+ε) · Â_r,t)]
+      L_cost ← E_M[r_t · Â_c,t]          # surrogate for constraint term
+      L_v   ← E_M[(V_ψ(s_t) − Ĝ_r,t)^2]
+      L_vc  ← E_M[(V^c_ξ(s_t) − Ĝ_c,t)^2]  # if cost critic used
+      H     ← E_M[entropy(π_θ(·|s_t))]
+      L_total ← −L_clip + λ · L_cost + c1·L_v + c2·L_vc − α·H
+      Take optimizer step on (θ, ψ, ξ) to minimize L_total.
+    end
+  end
+
+  # 4) Dual variable update (projected ascent)
+  J_c_emp ← mean episodic cost (or critic estimate)
+  λ ← max(0, λ + η_λ · (J_c_emp − d))
+
+  Log: return, cost, KL, clip frac, value losses, λ.
+until convergence
+```
 
 ## 6. Data & Dtype Flow
 | Stage | Device | Dtype Strategy |
@@ -134,6 +259,11 @@ NaN guards | Prevent silent training corruption | Forces recoverable defaults & 
 
 ## 12. Evaluation Plan
 Primary: Steps-to-threshold return, average cost vs limit, late-phase cost variance, overhead (steps/sec). Secondary: risk Loss, Risk/Corr, shaping influence ratio decay, modulation scale trajectory. Each ablation (shaping only, risk only, both, +potential) across ≥3 seeds; report mean ± 95% CI.
+
+Teacher validity & robustness checks:
+- Calibration: report ECE and reliability plots for risk predictions; include a small held‑out slice.
+- Counterfactuals: random prompts baseline and polarity‑swapped prompts; segmentation/object‑removal ablations to test spurious correlations.
+- Domain robustness: noise/jitter injections; report performance and `Semantics/ClampFrac` changes.
 
 ## 13. Limitations
 - Frozen visual encoder may lack domain-specific granularity (prompt engineering required).
